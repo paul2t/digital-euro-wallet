@@ -5,7 +5,8 @@ use crate::blind_sig::IssuerPublicKey;
 use crate::error::{Error, Result};
 use crate::field::Fp;
 use crate::identity::{WalletId, LIMBS};
-use crate::token::{SecretLines, Serial, SpendProof, Token, TokenPayload};
+use crate::merchant::PaymentRequest;
+use crate::token::{derive_challenge, SecretLines, Serial, SpendProof, Token, TokenPayload};
 use num_bigint::BigUint;
 use rand::Rng;
 use std::collections::BTreeMap;
@@ -233,11 +234,41 @@ impl<R: Rng> Wallet<R> {
     ///
     /// A sealed element refuses a second spend. A cracked one answers again —
     /// and in doing so releases the second point that solves for its identity.
-    pub fn pay(&mut self, serial: &Serial, challenge: Fp) -> Result<(Token, SpendProof)> {
-        if challenge.is_zero() {
-            return Err(Error::DegenerateChallenge);
+    ///
+    /// Answering is irreversible: once a point leaves the element, the token
+    /// is spent whether or not the merchant keeps the sale. So everything that
+    /// could make the merchant refuse is checked here first, and a request the
+    /// element would not honour costs nothing.
+    pub fn pay(
+        &mut self,
+        serial: &Serial,
+        request: &PaymentRequest,
+    ) -> Result<(Token, SpendProof)> {
+        // Recompute `x` rather than trusting the one supplied, so a terminal
+        // cannot steer the challenge (to `0`, or to one it has used before).
+        let challenge = derive_challenge(
+            &request.merchant_id,
+            request.timestamp,
+            request.amount_cents,
+            &request.nonce,
+        )?;
+        if challenge != request.challenge {
+            return Err(Error::ChallengeMismatch);
         }
         let stored = self.tokens.get_mut(serial).ok_or(Error::UnknownToken)?;
+        let payload = &stored.token.payload;
+        if payload.amount_cents != request.amount_cents {
+            return Err(Error::AmountMismatch {
+                expected: request.amount_cents,
+                found: payload.amount_cents,
+            });
+        }
+        if payload.expiry_epoch < request.timestamp {
+            return Err(Error::Expired {
+                expiry: payload.expiry_epoch,
+                now: request.timestamp,
+            });
+        }
         if let Some(previous) = &stored.spent_with {
             match self.state {
                 ElementState::Sealed => return Err(Error::TokenAlreadySpent),

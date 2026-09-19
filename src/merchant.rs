@@ -12,8 +12,11 @@ use rand::Rng;
 /// `challenge` is derived from the transaction data, so the merchant cannot
 /// quietly reuse a previous `x` — reusing one would keep a double-spender
 /// anonymous, since two points on the same abscissa do not determine a line.
+/// The request carries everything that went into the derivation, so the
+/// payer's element can recompute `x` itself before answering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentRequest {
+    pub merchant_id: [u8; 8],
     pub amount_cents: u64,
     pub timestamp: u64,
     pub nonce: [u8; 16],
@@ -48,6 +51,7 @@ impl<R: Rng> Merchant<R> {
             match derive_challenge(&self.id, timestamp, amount_cents, &nonce) {
                 Ok(challenge) => {
                     return Ok(PaymentRequest {
+                        merchant_id: self.id,
                         amount_cents,
                         timestamp,
                         nonce,

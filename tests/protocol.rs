@@ -60,7 +60,7 @@ fn spend(
     timestamp: u64,
 ) -> (Token, SpendProof) {
     let request = merchant.request_payment(AMOUNT, timestamp).unwrap();
-    let (token, proof) = wallet.pay(serial, request.challenge).unwrap();
+    let (token, proof) = wallet.pay(serial, &request).unwrap();
     merchant
         .accept(&request, token.clone(), proof.clone(), timestamp)
         .expect("merchant accepts");
@@ -97,7 +97,7 @@ fn sealed_element_refuses_a_second_spend() {
 
     let request = w.kiosk.request_payment(AMOUNT, NOW + 60).unwrap();
     assert_eq!(
-        w.alice.pay(&token.payload.serial, request.challenge),
+        w.alice.pay(&token.payload.serial, &request),
         Err(Error::TokenAlreadySpent)
     );
 }
@@ -180,15 +180,9 @@ fn reused_challenge_does_not_unmask_anyone() {
     let mut w = world(15);
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, first) = w
-        .alice
-        .pay(&token.payload.serial, request.challenge)
-        .unwrap();
+    let (_, first) = w.alice.pay(&token.payload.serial, &request).unwrap();
     w.alice.crack_secure_element();
-    let (_, second) = w
-        .alice
-        .pay(&token.payload.serial, request.challenge)
-        .unwrap();
+    let (_, second) = w.alice.pay(&token.payload.serial, &request).unwrap();
 
     assert_eq!(first, second);
     assert!(recover_identity(&first, &second).is_none());
@@ -243,10 +237,7 @@ fn merchant_rejects_a_tampered_token() {
     let mut w = world(18);
     let mut token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, proof) = w
-        .alice
-        .pay(&token.payload.serial, request.challenge)
-        .unwrap();
+    let (_, proof) = w.alice.pay(&token.payload.serial, &request).unwrap();
 
     token.payload.amount_cents = 50_00; // inflate the face value
     assert_eq!(
@@ -261,10 +252,7 @@ fn merchant_rejects_an_answer_to_a_different_challenge() {
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
     let bakery_request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
     let kiosk_request = w.kiosk.request_payment(AMOUNT, NOW).unwrap();
-    let (token, proof) = w
-        .alice
-        .pay(&token.payload.serial, kiosk_request.challenge)
-        .unwrap();
+    let (token, proof) = w.alice.pay(&token.payload.serial, &kiosk_request).unwrap();
 
     assert_eq!(
         w.bakery.accept(&bakery_request, token, proof, NOW),
@@ -273,19 +261,71 @@ fn merchant_rejects_an_answer_to_a_different_challenge() {
 }
 
 #[test]
-fn expired_token_is_refused() {
+fn expired_token_is_refused_by_the_element() {
     let mut w = world(20);
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, NOW - 1, 6, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (token, proof) = w
-        .alice
-        .pay(&token.payload.serial, request.challenge)
-        .unwrap();
+
+    assert!(matches!(
+        w.alice.pay(&token.payload.serial, &request),
+        Err(Error::Expired { .. })
+    ));
+    assert_eq!(
+        w.alice.offline_balance(),
+        AMOUNT,
+        "refusal must not burn the token"
+    );
+}
+
+#[test]
+fn expired_token_is_refused_by_the_terminal() {
+    // The element and the terminal can disagree about the time. The terminal
+    // enforces expiry against its own clock, whatever the request said.
+    let mut w = world(23);
+    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, NOW - 1, 6, &mut w.rng).unwrap();
+    let request = w.bakery.request_payment(AMOUNT, NOW - 2).unwrap();
+    let (token, proof) = w.alice.pay(&token.payload.serial, &request).unwrap();
 
     assert!(matches!(
         w.bakery.accept(&request, token, proof, NOW),
         Err(Error::Expired { .. })
     ));
+}
+
+#[test]
+fn wrong_amount_is_refused_without_burning_the_token() {
+    let mut w = world(24);
+    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
+
+    let short = w.bakery.request_payment(6_00, NOW).unwrap();
+    assert_eq!(
+        w.alice.pay(&token.payload.serial, &short),
+        Err(Error::AmountMismatch {
+            expected: 6_00,
+            found: AMOUNT
+        })
+    );
+    assert_eq!(w.alice.offline_balance(), AMOUNT);
+
+    // The token is untouched, so an exact payment still goes through.
+    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW + 1);
+    assert_eq!(w.alice.offline_balance(), 0);
+}
+
+#[test]
+fn element_refuses_a_request_whose_challenge_does_not_match_its_data() {
+    // A terminal that tampers with `x` (to replay an old one, say) is caught
+    // before the element answers, because the element derives `x` itself.
+    let mut w = world(25);
+    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
+    let mut request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
+    request.challenge = Fp::new(42);
+
+    assert_eq!(
+        w.alice.pay(&token.payload.serial, &request),
+        Err(Error::ChallengeMismatch)
+    );
+    assert_eq!(w.alice.offline_balance(), AMOUNT);
 }
 
 #[test]

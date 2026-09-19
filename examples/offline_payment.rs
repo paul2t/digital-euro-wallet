@@ -47,7 +47,7 @@ fn main() {
     println!("\n── offline payment at the bakery (both devices air-gapped)");
     let request = bakery.request_payment(10_00, NOW).unwrap();
     println!("   challenge x1 = {}", request.challenge);
-    let (paid_token, proof) = alice.pay(&token.payload.serial, request.challenge).unwrap();
+    let (paid_token, proof) = alice.pay(&token.payload.serial, &request).unwrap();
     let first_point = proof.response[0];
     bakery
         .accept(&request, paid_token, proof, NOW)
@@ -56,7 +56,7 @@ fn main() {
 
     println!("\n── the secure element is sealed: a second spend is refused");
     let retry = kiosk.request_payment(10_00, NOW + 60).unwrap();
-    match alice.pay(&token.payload.serial, retry.challenge) {
+    match alice.pay(&token.payload.serial, &retry) {
         Err(error) => println!("   {error}"),
         Ok(_) => unreachable!("a sealed element must refuse"),
     }
@@ -64,7 +64,7 @@ fn main() {
     println!("\n── attacker rolls back the element's anti-replay state");
     alice.crack_secure_element();
     assert_eq!(alice.state(), ElementState::Cracked);
-    let (cloned_token, second_proof) = alice.pay(&token.payload.serial, retry.challenge).unwrap();
+    let (cloned_token, second_proof) = alice.pay(&token.payload.serial, &retry).unwrap();
     println!("   challenge x2 = {}", retry.challenge);
     println!(
         "   response  y2 = {} (first limb)",

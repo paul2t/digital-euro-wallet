@@ -133,7 +133,7 @@ fn honest_lifecycle(cfg: &Config, notes: &mut Notes) -> Outcome {
         .map_err(|e| e.to_string())?;
     let (token_copy, proof) = w
         .alice
-        .pay(&token.payload.serial, request.challenge)
+        .pay(&token.payload.serial, &request)
         .map_err(|e| format!("sealed element refused an honest payment: {e}"))?;
     w.bakery
         .accept(&request, token_copy, proof, NOW)
@@ -190,10 +190,7 @@ fn sealed_element_refuses_a_replay(cfg: &Config, notes: &mut Notes) -> Outcome {
         .bakery
         .request_payment(cfg.amount, NOW)
         .map_err(|e| e.to_string())?;
-    let (t, p) = w
-        .alice
-        .pay(&serial, first.challenge)
-        .map_err(|e| e.to_string())?;
+    let (t, p) = w.alice.pay(&serial, &first).map_err(|e| e.to_string())?;
     w.bakery
         .accept(&first, t, p, NOW)
         .map_err(|e| e.to_string())?;
@@ -206,7 +203,7 @@ fn sealed_element_refuses_a_replay(cfg: &Config, notes: &mut Notes) -> Outcome {
         .kiosk
         .request_payment(cfg.amount, NOW + 60)
         .map_err(|e| e.to_string())?;
-    match w.alice.pay(&serial, second.challenge) {
+    match w.alice.pay(&serial, &second) {
         Err(Error::TokenAlreadySpent) => {
             note!(notes, "second spend refused in hardware, before any maths");
             Ok(())
@@ -234,10 +231,7 @@ fn double_spend_unmasks_the_payer(cfg: &Config, notes: &mut Notes) -> Outcome {
         .bakery
         .request_payment(cfg.amount, NOW)
         .map_err(|e| e.to_string())?;
-    let (t1, p1) = w
-        .alice
-        .pay(&serial, first.challenge)
-        .map_err(|e| e.to_string())?;
+    let (t1, p1) = w.alice.pay(&serial, &first).map_err(|e| e.to_string())?;
     w.bakery
         .accept(&first, t1, p1.clone(), NOW)
         .map_err(|e| e.to_string())?;
@@ -250,7 +244,7 @@ fn double_spend_unmasks_the_payer(cfg: &Config, notes: &mut Notes) -> Outcome {
         .map_err(|e| e.to_string())?;
     let (t2, p2) = w
         .alice
-        .pay(&serial, second.challenge)
+        .pay(&serial, &second)
         .map_err(|e| format!("cracked element should answer again: {e}"))?;
     w.kiosk
         .accept(&second, t2, p2.clone(), NOW + 60)
@@ -333,14 +327,8 @@ fn repeated_challenge_keeps_the_payer_anonymous(cfg: &Config, notes: &mut Notes)
         .request_payment(cfg.amount, NOW)
         .map_err(|e| e.to_string())?;
     w.alice.crack_secure_element();
-    let (t1, p1) = w
-        .alice
-        .pay(&serial, request.challenge)
-        .map_err(|e| e.to_string())?;
-    let (t2, p2) = w
-        .alice
-        .pay(&serial, request.challenge)
-        .map_err(|e| e.to_string())?;
+    let (t1, p1) = w.alice.pay(&serial, &request).map_err(|e| e.to_string())?;
+    let (t2, p2) = w.alice.pay(&serial, &request).map_err(|e| e.to_string())?;
     ensure!(p1 == p2, "the same challenge must give the same answer");
 
     w.bakery
@@ -437,7 +425,7 @@ fn one_point_hides_every_slope(cfg: &Config, notes: &mut Notes) -> Outcome {
         .map_err(|e| e.to_string())?;
     let (_, proof) = w
         .alice
-        .pay(&token.payload.serial, request.challenge)
+        .pay(&token.payload.serial, &request)
         .map_err(|e| e.to_string())?;
 
     // For any slope whatsoever there is exactly one intercept through the
@@ -485,7 +473,7 @@ fn merchant_rejects_a_tampered_token(cfg: &Config, notes: &mut Notes) -> Outcome
         .map_err(|e| e.to_string())?;
     let (mut tampered, proof) = w
         .alice
-        .pay(&token.payload.serial, request.challenge)
+        .pay(&token.payload.serial, &request)
         .map_err(|e| e.to_string())?;
 
     tampered.payload.commitment[0] ^= 0xff;
@@ -502,8 +490,9 @@ fn merchant_rejects_a_tampered_token(cfg: &Config, notes: &mut Notes) -> Outcome
     }
 }
 
-/// Expiry is enforced by the terminal, offline, with no network.
-fn expired_token_is_refused(cfg: &Config, notes: &mut Notes) -> Outcome {
+/// A sale the element will not honour — wrong amount, or past expiry — is
+/// refused before any point leaves the element, so it costs the payer nothing.
+fn refused_sale_does_not_burn_the_token(cfg: &Config, notes: &mut Notes) -> Outcome {
     let mut w = world(cfg, cfg.seed + 7);
     let token = withdraw(
         &mut w.alice,
@@ -514,28 +503,51 @@ fn expired_token_is_refused(cfg: &Config, notes: &mut Notes) -> Outcome {
         &mut w.rng,
     )
     .map_err(|e| e.to_string())?;
+    let serial = token.payload.serial;
+
+    let short = w
+        .bakery
+        .request_payment(cfg.amount - 1, NOW)
+        .map_err(|e| e.to_string())?;
+    match w.alice.pay(&serial, &short) {
+        Err(Error::AmountMismatch { .. }) => {}
+        Err(other) => return Err(format!("expected AmountMismatch, got {other}")),
+        Ok(_) => return Err("element answered a request for the wrong amount".into()),
+    }
+
     let late = EXPIRY + 1;
-    let request = w
+    let stale = w
         .bakery
         .request_payment(cfg.amount, late)
         .map_err(|e| e.to_string())?;
+    match w.alice.pay(&serial, &stale) {
+        Err(Error::Expired { expiry, now }) => ensure!(
+            expiry == EXPIRY && now == late,
+            "wrong expiry values reported"
+        ),
+        Err(other) => return Err(format!("expected Expired, got {other}")),
+        Ok(_) => return Err("element answered after expiry".into()),
+    }
+
+    ensure!(
+        w.alice.offline_balance() == cfg.amount,
+        "a refused sale cost the payer the token"
+    );
+    let exact = w
+        .bakery
+        .request_payment(cfg.amount, NOW)
+        .map_err(|e| e.to_string())?;
     let (t, p) = w
         .alice
-        .pay(&token.payload.serial, request.challenge)
+        .pay(&serial, &exact)
+        .map_err(|e| format!("token unusable after a refused sale: {e}"))?;
+    w.bakery
+        .accept(&exact, t, p, NOW)
         .map_err(|e| e.to_string())?;
 
-    match w.bakery.accept(&request, t, p, late) {
-        Err(Error::Expired { expiry, now }) => {
-            ensure!(
-                expiry == EXPIRY && now == late,
-                "wrong expiry values reported"
-            );
-            note!(notes, "token expired at {expiry}, presented at {now}");
-            Ok(())
-        }
-        Err(other) => Err(format!("expected Expired, got {other}")),
-        Ok(_) => Err("terminal accepted an expired token".into()),
-    }
+    note!(notes, "wrong amount and expired sale refused, token intact");
+    note!(notes, "the exact payment afterwards went through");
+    Ok(())
 }
 
 /// Noise instead of honest answers must not frame an innocent account.
@@ -616,10 +628,7 @@ fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
                 .request_payment(cfg.amount, timestamp)
                 .map_err(|e| e.to_string())?;
             ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w
-                .alice
-                .pay(serial, r.challenge)
-                .map_err(|e| e.to_string())?;
+            let (t, p) = w.alice.pay(serial, &r).map_err(|e| e.to_string())?;
             w.bakery.accept(&r, t, p, timestamp)
         } else {
             let r = w
@@ -627,10 +636,7 @@ fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
                 .request_payment(cfg.amount, timestamp)
                 .map_err(|e| e.to_string())?;
             ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w
-                .alice
-                .pay(serial, r.challenge)
-                .map_err(|e| e.to_string())?;
+            let (t, p) = w.alice.pay(serial, &r).map_err(|e| e.to_string())?;
             w.kiosk.accept(&r, t, p, timestamp)
         };
         accepted.map_err(|e| format!("payment {index} refused: {e}"))?;
@@ -780,7 +786,10 @@ fn run_check(cfg: &Config) -> bool {
             "terminal rejects a tampered token",
             merchant_rejects_a_tampered_token,
         ),
-        ("expired token is refused offline", expired_token_is_refused),
+        (
+            "refused sale does not burn the token",
+            refused_sale_does_not_burn_the_token,
+        ),
         (
             "garbage answers accuse nobody",
             garbage_answers_accuse_nobody,
