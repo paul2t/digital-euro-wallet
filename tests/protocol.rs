@@ -32,9 +32,17 @@ fn world(seed: u64) -> World {
     let alice_id = WalletId::from_bytes(rng.gen());
     issuer.open_account(alice_id, 100_00);
     World {
-        alice: Wallet::new(alice_id, public_key.clone(), StdRng::seed_from_u64(seed + 1)),
+        alice: Wallet::new(
+            alice_id,
+            public_key.clone(),
+            StdRng::seed_from_u64(seed + 1),
+        ),
         alice_id,
-        bakery: Merchant::new(*b"BAKERY01", public_key.clone(), StdRng::seed_from_u64(seed + 2)),
+        bakery: Merchant::new(
+            *b"BAKERY01",
+            public_key.clone(),
+            StdRng::seed_from_u64(seed + 2),
+        ),
         kiosk: Merchant::new(*b"KIOSK_02", public_key, StdRng::seed_from_u64(seed + 3)),
         issuer,
         rng,
@@ -68,7 +76,9 @@ fn honest_payment_settles_and_stays_anonymous() {
     for receipt in w.bakery.drain_deposits() {
         assert_eq!(
             w.issuer.redeem(&receipt),
-            Settlement::Credited { amount_cents: AMOUNT }
+            Settlement::Credited {
+                amount_cents: AMOUNT
+            }
         );
     }
     assert_eq!(w.issuer.outstanding_cents(), 0);
@@ -105,7 +115,12 @@ fn double_spend_reveals_the_payer() {
         settlements.push(w.issuer.redeem(&receipt));
     }
 
-    assert_eq!(settlements[0], Settlement::Credited { amount_cents: AMOUNT });
+    assert_eq!(
+        settlements[0],
+        Settlement::Credited {
+            amount_cents: AMOUNT
+        }
+    );
     match &settlements[1] {
         Settlement::DoubleSpend(report) => {
             assert_eq!(report.culprit.as_ref().unwrap(), &w.alice_id);
@@ -146,7 +161,9 @@ fn duplicate_deposit_of_the_same_receipt_is_idempotent() {
     let receipts = w.bakery.drain_deposits();
     assert_eq!(
         w.issuer.redeem(&receipts[0]),
-        Settlement::Credited { amount_cents: AMOUNT }
+        Settlement::Credited {
+            amount_cents: AMOUNT
+        }
     );
     assert_eq!(w.issuer.redeem(&receipts[0]), Settlement::DuplicateDeposit);
     assert!(!w.issuer.is_suspended(&w.alice_id));
@@ -159,9 +176,15 @@ fn reused_challenge_does_not_unmask_anyone() {
     let mut w = world(15);
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, first) = w.alice.pay(&token.payload.serial, request.challenge).unwrap();
+    let (_, first) = w
+        .alice
+        .pay(&token.payload.serial, request.challenge)
+        .unwrap();
     w.alice.crack_secure_element();
-    let (_, second) = w.alice.pay(&token.payload.serial, request.challenge).unwrap();
+    let (_, second) = w
+        .alice
+        .pay(&token.payload.serial, request.challenge)
+        .unwrap();
 
     assert_eq!(first, second);
     assert!(recover_identity(&first, &second).is_none());
@@ -216,7 +239,10 @@ fn merchant_rejects_a_tampered_token() {
     let mut w = world(18);
     let mut token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, proof) = w.alice.pay(&token.payload.serial, request.challenge).unwrap();
+    let (_, proof) = w
+        .alice
+        .pay(&token.payload.serial, request.challenge)
+        .unwrap();
 
     token.payload.amount_cents = 50_00; // inflate the face value
     assert_eq!(
@@ -231,7 +257,10 @@ fn merchant_rejects_an_answer_to_a_different_challenge() {
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
     let bakery_request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
     let kiosk_request = w.kiosk.request_payment(AMOUNT, NOW).unwrap();
-    let (token, proof) = w.alice.pay(&token.payload.serial, kiosk_request.challenge).unwrap();
+    let (token, proof) = w
+        .alice
+        .pay(&token.payload.serial, kiosk_request.challenge)
+        .unwrap();
 
     assert_eq!(
         w.bakery.accept(&bakery_request, token, proof, NOW),
@@ -244,7 +273,10 @@ fn expired_token_is_refused() {
     let mut w = world(20);
     let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, NOW - 1, 6, &mut w.rng).unwrap();
     let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (token, proof) = w.alice.pay(&token.payload.serial, request.challenge).unwrap();
+    let (token, proof) = w
+        .alice
+        .pay(&token.payload.serial, request.challenge)
+        .unwrap();
 
     assert!(matches!(
         w.bakery.accept(&request, token, proof, NOW),
@@ -266,7 +298,10 @@ fn garbage_responses_recover_no_valid_identity() {
         response: [(); LIMBS].map(|_| Fp::random(&mut rng)),
     };
     let recovered = recover_identity(&first, &second).unwrap();
-    assert!(recovered.is_err(), "random points must not decode to an identity");
+    assert!(
+        recovered.is_err(),
+        "random points must not decode to an identity"
+    );
 }
 
 #[test]

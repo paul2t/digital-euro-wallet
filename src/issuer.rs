@@ -244,7 +244,8 @@ impl Issuer {
         // Two points, two different abscissae — solve for the slope.
         let culprit = recover_identity(&previous.proof, &receipt.proof)
             .expect("challenges differ, so the inverse exists");
-        let account_known = matches!(&culprit, Ok(identity) if self.accounts.contains_key(identity));
+        let account_known =
+            matches!(&culprit, Ok(identity) if self.accounts.contains_key(identity));
         if let Ok(identity) = &culprit {
             if let Some(account) = self.accounts.get_mut(identity) {
                 account.suspended = true;

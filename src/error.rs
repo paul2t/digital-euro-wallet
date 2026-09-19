@@ -33,7 +33,11 @@ pub enum Error {
     /// The withdrawal opening does not cover exactly the requested indices.
     BadOpening,
     /// Recovered slopes are not a well-formed wallet identity.
-    MalformedIdentity { limb: usize, value: u64, budget: u32 },
+    MalformedIdentity {
+        limb: usize,
+        value: u64,
+        budget: u32,
+    },
     /// Account unknown to the issuer.
     UnknownAccount(WalletId),
     /// Not enough funds on the online account to fund the requested tokens.
@@ -49,27 +53,46 @@ impl fmt::Display for Error {
             Error::ChallengeMismatch => write!(f, "payer answered the wrong challenge"),
             Error::DegenerateChallenge => write!(f, "challenge x = 0 is not allowed"),
             Error::AmountMismatch { expected, found } => {
-                write!(f, "amount mismatch: expected {expected} cents, token is {found}")
+                write!(
+                    f,
+                    "amount mismatch: expected {expected} cents, token is {found}"
+                )
             }
             Error::Expired { expiry, now } => write!(f, "token expired at {expiry} (now {now})"),
             Error::TokenAlreadySpent => write!(f, "secure element refused: token already spent"),
             Error::UnknownToken => write!(f, "unknown token"),
             Error::CommitmentMismatch { index } => {
-                write!(f, "candidate {index}: commitment does not match opened values")
+                write!(
+                    f,
+                    "candidate {index}: commitment does not match opened values"
+                )
             }
             Error::IdentityNotEmbedded { index } => {
-                write!(f, "candidate {index}: slopes do not encode the account identity")
+                write!(
+                    f,
+                    "candidate {index}: slopes do not encode the account identity"
+                )
             }
             Error::BlindingMismatch { index } => {
-                write!(f, "candidate {index}: blinded message inconsistent with opening")
+                write!(
+                    f,
+                    "candidate {index}: blinded message inconsistent with opening"
+                )
             }
             Error::BadOpening => write!(f, "opening does not match the requested indices"),
-            Error::MalformedIdentity { limb, value, budget } => write!(
+            Error::MalformedIdentity {
+                limb,
+                value,
+                budget,
+            } => write!(
                 f,
                 "recovered limb {limb} = {value} exceeds its {budget}-bit budget"
             ),
             Error::UnknownAccount(id) => write!(f, "unknown account {}", id.short()),
-            Error::InsufficientFunds { requested, available } => {
+            Error::InsufficientFunds {
+                requested,
+                available,
+            } => {
                 write!(f, "insufficient funds: need {requested}, have {available}")
             }
             Error::BadParameters(message) => write!(f, "bad parameters: {message}"),

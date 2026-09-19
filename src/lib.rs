@@ -81,7 +81,8 @@ pub fn withdraw<WR: Rng, IR: Rng + ?Sized>(
     candidate_count: usize,
     issuer_rng: &mut IR,
 ) -> Result<Token> {
-    let (request, session) = wallet.begin_withdrawal(amount_cents, expiry_epoch, candidate_count)?;
+    let (request, session) =
+        wallet.begin_withdrawal(amount_cents, expiry_epoch, candidate_count)?;
     let cut = issuer.cut(&request, issuer_rng)?;
     let opening = wallet.answer_cut(&session, &cut)?;
     let blinded_signature = issuer.issue(&request, &cut, &opening)?;

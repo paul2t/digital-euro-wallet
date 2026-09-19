@@ -73,7 +73,8 @@ impl IssuerPublicKey {
 
     /// `s' * r^-1 mod n` — turns the issuer's answer into a usable signature.
     pub fn unblind(&self, blinded_signature: &BigUint, r: &BigUint) -> BigUint {
-        let inverse = mod_inverse(r, &self.n).expect("blinding factor is invertible by construction");
+        let inverse =
+            mod_inverse(r, &self.n).expect("blinding factor is invertible by construction");
         (blinded_signature * inverse).mod_floor(&self.n)
     }
 }
@@ -90,7 +91,10 @@ impl IssuerKeypair {
     ///
     /// `bits` is the modulus size; use >= 2048 for anything but tests.
     pub fn generate<R: Rng + ?Sized>(bits: u64, rng: &mut R) -> Self {
-        assert!(bits >= 512 && bits % 2 == 0, "modulus size must be even and >= 512");
+        assert!(
+            bits >= 512 && bits % 2 == 0,
+            "modulus size must be even and >= 512"
+        );
         let e = BigUint::from(65537u32);
         loop {
             let p = generate_prime(bits / 2, rng);
@@ -237,7 +241,15 @@ mod tests {
     #[test]
     fn miller_rabin_agrees_with_known_values() {
         let mut rng = StdRng::seed_from_u64(1);
-        assert!(is_probable_prime(&BigUint::from(2_147_483_647u32), 20, &mut rng)); // 2^31-1
-        assert!(!is_probable_prime(&BigUint::from(2_147_483_649u32), 20, &mut rng));
+        assert!(is_probable_prime(
+            &BigUint::from(2_147_483_647u32),
+            20,
+            &mut rng
+        )); // 2^31-1
+        assert!(!is_probable_prime(
+            &BigUint::from(2_147_483_649u32),
+            20,
+            &mut rng
+        ));
     }
 }

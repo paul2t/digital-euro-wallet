@@ -74,7 +74,10 @@ impl<R: Rng> Merchant<R> {
         proof: SpendProof,
         now_epoch: u64,
     ) -> Result<Receipt> {
-        if !self.issuer.verify(&token.payload.digest(), &token.signature) {
+        if !self
+            .issuer
+            .verify(&token.payload.digest(), &token.signature)
+        {
             return Err(Error::InvalidTokenSignature);
         }
         if token.payload.amount_cents != request.amount_cents {

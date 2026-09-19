@@ -22,18 +22,27 @@ fn main() {
     issuer.open_account(alice_id, 50_00);
     let mut alice = Wallet::new(alice_id, public_key.clone(), StdRng::seed_from_u64(1));
     println!("   Alice's wallet identity: {}…", alice_id.short());
-    println!("   online account balance:  {} cents", issuer.balance_of(&alice_id).unwrap());
+    println!(
+        "   online account balance:  {} cents",
+        issuer.balance_of(&alice_id).unwrap()
+    );
 
     let mut bakery = Merchant::new(*b"BAKERY01", public_key.clone(), StdRng::seed_from_u64(2));
     let mut kiosk = Merchant::new(*b"KIOSK_02", public_key.clone(), StdRng::seed_from_u64(3));
 
     println!("\n── funding: one 10.00 € token, cut-and-choose over {CANDIDATES} candidates");
-    let token = withdraw(&mut alice, &mut issuer, 10_00, EXPIRY, CANDIDATES, &mut rng)
-        .expect("withdrawal");
+    let token =
+        withdraw(&mut alice, &mut issuer, 10_00, EXPIRY, CANDIDATES, &mut rng).expect("withdrawal");
     println!("   token serial:            {}", hex(&token.payload.serial));
     println!("   issuer never saw it, yet certified the identity inside it");
-    println!("   online balance now:      {} cents", issuer.balance_of(&alice_id).unwrap());
-    println!("   offline balance:         {} cents", alice.offline_balance());
+    println!(
+        "   online balance now:      {} cents",
+        issuer.balance_of(&alice_id).unwrap()
+    );
+    println!(
+        "   offline balance:         {} cents",
+        alice.offline_balance()
+    );
 
     println!("\n── offline payment at the bakery (both devices air-gapped)");
     let request = bakery.request_payment(10_00, NOW).unwrap();
@@ -57,7 +66,10 @@ fn main() {
     assert_eq!(alice.state(), ElementState::Cracked);
     let (cloned_token, second_proof) = alice.pay(&token.payload.serial, retry.challenge).unwrap();
     println!("   challenge x2 = {}", retry.challenge);
-    println!("   response  y2 = {} (first limb)", second_proof.response[0]);
+    println!(
+        "   response  y2 = {} (first limb)",
+        second_proof.response[0]
+    );
     kiosk
         .accept(&retry, cloned_token, second_proof, NOW + 60)
         .expect("kiosk accepts — it cannot tell, offline");
@@ -71,8 +83,14 @@ fn main() {
     }
 
     println!("\n── aftermath");
-    println!("   account suspended:       {}", issuer.is_suspended(&alice_id));
-    println!("   online balance:          {} cents", issuer.balance_of(&alice_id).unwrap());
+    println!(
+        "   account suspended:       {}",
+        issuer.is_suspended(&alice_id)
+    );
+    println!(
+        "   online balance:          {} cents",
+        issuer.balance_of(&alice_id).unwrap()
+    );
 }
 
 fn report(settlement: Settlement, who: &str) {

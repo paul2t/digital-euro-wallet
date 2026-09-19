@@ -182,11 +182,7 @@ impl<R: Rng> Wallet<R> {
     }
 
     /// Step 2: open every candidate except the one the issuer kept.
-    pub fn answer_cut(
-        &self,
-        session: &WithdrawalSession,
-        cut: &CutChallenge,
-    ) -> Result<Opening> {
+    pub fn answer_cut(&self, session: &WithdrawalSession, cut: &CutChallenge) -> Result<Opening> {
         if cut.keep >= session.secrets.len() {
             return Err(Error::BadOpening);
         }

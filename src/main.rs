@@ -80,7 +80,11 @@ fn world(cfg: &Config, seed: u64) -> World {
     let alice_id = WalletId::from_bytes(rng.gen());
     issuer.open_account(alice_id, cfg.opening_balance);
     World {
-        alice: Wallet::new(alice_id, public_key.clone(), StdRng::seed_from_u64(seed ^ 0xa1)),
+        alice: Wallet::new(
+            alice_id,
+            public_key.clone(),
+            StdRng::seed_from_u64(seed ^ 0xa1),
+        ),
         alice_id,
         bakery: Merchant::new(
             *b"BAKERY01",
@@ -286,7 +290,10 @@ fn double_spend_unmasks_the_payer(cfg: &Config, notes: &mut Notes) -> Outcome {
         report.account_known,
         "recovered identity did not match a known account"
     );
-    ensure!(report.serial == serial, "fraud report names the wrong serial");
+    ensure!(
+        report.serial == serial,
+        "fraud report names the wrong serial"
+    );
     ensure!(
         w.issuer.is_suspended(&w.alice_id),
         "double spender was not suspended"
@@ -296,7 +303,10 @@ fn double_spend_unmasks_the_payer(cfg: &Config, notes: &mut Notes) -> Outcome {
     let solved = recover_identity(&p1, &p2)
         .ok_or("recover_identity refused two distinct challenges")?
         .map_err(|e| e.to_string())?;
-    ensure!(solved == w.alice_id, "direct solve disagreed with the issuer");
+    ensure!(
+        solved == w.alice_id,
+        "direct solve disagreed with the issuer"
+    );
 
     note!(notes, "x1 = {}, x2 = {}", p1.challenge, p2.challenge);
     note!(notes, "I = (y1-y2)(x1-x2)^-1 = {recovered}");
@@ -359,7 +369,10 @@ fn repeated_challenge_keeps_the_payer_anonymous(cfg: &Config, notes: &mut Notes)
         "two points on the same abscissa must not yield an identity"
     );
 
-    note!(notes, "paid once, deposited twice — no identity extractable");
+    note!(
+        notes,
+        "paid once, deposited twice — no identity extractable"
+    );
     Ok(())
 }
 
@@ -603,7 +616,10 @@ fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
                 .request_payment(cfg.amount, timestamp)
                 .map_err(|e| e.to_string())?;
             ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w.alice.pay(serial, r.challenge).map_err(|e| e.to_string())?;
+            let (t, p) = w
+                .alice
+                .pay(serial, r.challenge)
+                .map_err(|e| e.to_string())?;
             w.bakery.accept(&r, t, p, timestamp)
         } else {
             let r = w
@@ -611,7 +627,10 @@ fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
                 .request_payment(cfg.amount, timestamp)
                 .map_err(|e| e.to_string())?;
             ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w.alice.pay(serial, r.challenge).map_err(|e| e.to_string())?;
+            let (t, p) = w
+                .alice
+                .pay(serial, r.challenge)
+                .map_err(|e| e.to_string())?;
             w.kiosk.accept(&r, t, p, timestamp)
         };
         accepted.map_err(|e| format!("payment {index} refused: {e}"))?;
@@ -649,7 +668,10 @@ fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
         "honest payer suspended"
     );
 
-    note!(notes, "{count} tokens issued and settled across 2 terminals");
+    note!(
+        notes,
+        "{count} tokens issued and settled across 2 terminals"
+    );
     note!(
         notes,
         "{remaining}c on account + {credited}c credited = {start}c"
@@ -671,7 +693,11 @@ fn funding_requires_a_funded_account(cfg: &Config, notes: &mut Notes) -> Outcome
     }
 
     let stranger_id = WalletId::from_bytes([9u8; 32]);
-    let mut stranger = Wallet::new(stranger_id, w.issuer.public_key(), StdRng::seed_from_u64(77));
+    let mut stranger = Wallet::new(
+        stranger_id,
+        w.issuer.public_key(),
+        StdRng::seed_from_u64(77),
+    );
     let (request, _) = stranger
         .begin_withdrawal(cfg.amount, EXPIRY, cfg.candidates)
         .map_err(|e| e.to_string())?;
@@ -680,7 +706,10 @@ fn funding_requires_a_funded_account(cfg: &Config, notes: &mut Notes) -> Outcome
         other => return Err(format!("expected UnknownAccount, got {other:?}")),
     }
 
-    note!(notes, "overdraft and unknown-account withdrawals both refused");
+    note!(
+        notes,
+        "overdraft and unknown-account withdrawals both refused"
+    );
     Ok(())
 }
 
@@ -730,8 +759,14 @@ fn run_check(cfg: &Config) -> bool {
             "honest lifecycle settles and stays anonymous",
             honest_lifecycle,
         ),
-        ("sealed element refuses a replay", sealed_element_refuses_a_replay),
-        ("double spend unmasks the payer", double_spend_unmasks_the_payer),
+        (
+            "sealed element refuses a replay",
+            sealed_element_refuses_a_replay,
+        ),
+        (
+            "double spend unmasks the payer",
+            double_spend_unmasks_the_payer,
+        ),
         (
             "repeated challenge keeps the payer anonymous",
             repeated_challenge_keeps_the_payer_anonymous,
@@ -741,11 +776,20 @@ fn run_check(cfg: &Config) -> bool {
             cut_and_choose_catches_a_forged_identity,
         ),
         ("one point hides every slope", one_point_hides_every_slope),
-        ("terminal rejects a tampered token", merchant_rejects_a_tampered_token),
+        (
+            "terminal rejects a tampered token",
+            merchant_rejects_a_tampered_token,
+        ),
         ("expired token is refused offline", expired_token_is_refused),
-        ("garbage answers accuse nobody", garbage_answers_accuse_nobody),
+        (
+            "garbage answers accuse nobody",
+            garbage_answers_accuse_nobody,
+        ),
         ("ledger conserves value", ledger_conserves_value),
-        ("funding requires a funded account", funding_requires_a_funded_account),
+        (
+            "funding requires a funded account",
+            funding_requires_a_funded_account,
+        ),
     ];
 
     println!("acceptance scenarios");

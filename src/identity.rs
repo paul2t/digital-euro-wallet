@@ -68,11 +68,7 @@ impl WalletId {
         let words = self.words();
         let mut limbs = [Fp::ZERO; LIMBS];
         for (j, limb) in limbs.iter_mut().enumerate() {
-            *limb = Fp::new(Self::extract_bits(
-                &words,
-                j as u32 * LIMB_BITS,
-                LIMB_BITS,
-            ));
+            *limb = Fp::new(Self::extract_bits(&words, j as u32 * LIMB_BITS, LIMB_BITS));
         }
         limbs
     }
