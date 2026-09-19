@@ -1,6 +1,10 @@
 //! Protocol-level tests: anonymity holds for one spend, identity falls out on
 //! two, cut-and-choose catches a forged identity, and honest cases settle.
 
+// Amounts are written as cents with the euros split off (`100_00` is 100.00 €),
+// the same convention the example and the harness binary use.
+#![allow(clippy::inconsistent_digit_grouping)]
+
 use digital_euro_wallet::blind_sig::IssuerKeypair;
 use digital_euro_wallet::error::Error;
 use digital_euro_wallet::field::Fp;

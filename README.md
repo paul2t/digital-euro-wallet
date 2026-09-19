@@ -153,4 +153,13 @@ tests/protocol.rs             protocol-level tests
 ```
 
 Dependencies are pinned to versions that build on Rust 1.75 (`sha2`,
-`num-bigint`, `num-integer`, `num-traits`, `rand`).
+`num-bigint`, `num-integer`, `num-traits`, `rand`), and that minimum is declared
+as `rust-version` in `Cargo.toml` so cargo enforces it and clippy stops
+suggesting standard-library APIs that only exist on newer toolchains.
+
+`cargo clippy --all-targets -- -D warnings` is clean. Two lints are suppressed
+deliberately rather than fixed, each with the reason recorded at the site:
+`should_implement_trait` on `Fp`, because the reduction mod `p` should stay
+visible at the call site instead of hiding behind `+`, and
+`inconsistent_digit_grouping`, because amounts are written as cents with the
+euros split off (`100_00` is 100.00 €).

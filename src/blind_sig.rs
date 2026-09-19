@@ -28,7 +28,7 @@ pub struct IssuerPublicKey {
 impl IssuerPublicKey {
     /// Size of the modulus in bytes.
     pub fn modulus_bytes(&self) -> usize {
-        (self.n.bits() as usize + 7) / 8
+        (self.n.bits() as usize).div_ceil(8)
     }
 
     /// Full-domain hash: expand the 32-byte message digest to the width of the

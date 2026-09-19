@@ -17,6 +17,12 @@ pub const P: u64 = (1u64 << 61) - 1;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Fp(u64);
 
+// The arithmetic is deliberately spelled out as `add`/`sub`/`mul`/`neg` rather
+// than the `std::ops` operators: every one of these carries a reduction mod `p`,
+// and naming the call keeps that visible at the use site instead of hiding it
+// behind an innocuous `+`. Implementing the operator traits instead would read
+// more like ordinary arithmetic, which here is precisely what it is not.
+#[allow(clippy::should_implement_trait)]
 impl Fp {
     pub const ZERO: Fp = Fp(0);
     pub const ONE: Fp = Fp(1);
