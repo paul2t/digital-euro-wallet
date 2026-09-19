@@ -6,7 +6,7 @@ edition = "2021"
 # also keeps clippy from suggesting APIs that are newer than what is supported
 # (`u64::is_multiple_of`, for one, landed well after 1.75).
 rust-version = "1.75"
-description = "Offline digital euro wallet: Chaum-Fiat-Naor e-cash with double-spend identity recovery"
+description = "Model of the offline digital euro: secure-element balances, certified devices, local settlement"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

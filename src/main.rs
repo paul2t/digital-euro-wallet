@@ -1,39 +1,28 @@
 //! Command-line acceptance harness for the offline digital euro wallet.
 //!
-//! `cargo test` checks the pieces in isolation. This binary drives whole
-//! protocol runs end to end and asserts the outcome of each, including two
+//! `cargo test` checks the pieces in isolation. This binary drives whole runs
+//! across several devices and asserts the outcome of each, including
 //! properties that only make sense in aggregate:
 //!
-//! * value conservation across issuance and settlement, and
-//! * the cut-and-choose soundness bound, measured empirically against `1/n`.
-//!
 //! ```text
-//! digital-euro-wallet check       # every scenario, PASS/FAIL, exit code
-//! digital-euro-wallet soundness   # measure the forgery escape rate
+//! digital-euro-wallet check   # every scenario, PASS/FAIL, exit code
+//! digital-euro-wallet fuzz    # random operations, invariants after each one
 //! ```
 
 // Amounts are written as cents with the euros split off (`10_00` is 10.00 €),
 // the same convention the library's tests and example use.
 #![allow(clippy::inconsistent_digit_grouping)]
 
-use digital_euro_wallet::blind_sig::{IssuerKeypair, IssuerPublicKey};
-use digital_euro_wallet::error::Error;
-use digital_euro_wallet::field::Fp;
-use digital_euro_wallet::identity::LIMBS;
-use digital_euro_wallet::token::recover_identity;
-use digital_euro_wallet::wallet::{Candidate, CandidateOpening};
 use digital_euro_wallet::{
-    withdraw, ElementState, Issuer, Merchant, SecretLines, Settlement, SpendProof, TokenPayload,
-    Wallet, WalletId,
+    defund, enrol, fund, pay, AccountId, DeviceCertificate, Error, Issuer, Keypair, Wallet,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Instant;
 
-const EXPIRY: u64 = 1_800_000_000;
-const NOW: u64 = 1_780_000_000;
-
+type Device = Wallet<StdRng>;
 /// Lines a scenario wants printed underneath its verdict.
 type Notes = Vec<String>;
 /// `Ok(())` is a pass; `Err` carries why it failed.
@@ -53,708 +42,323 @@ macro_rules! note {
 }
 
 struct Config {
-    keypair: IssuerKeypair,
+    issuer_key: Keypair,
+    key_bits: u64,
     seed: u64,
-    amount: u64,
-    candidates: usize,
-    opening_balance: u64,
-    trials: usize,
+    limit: u64,
+    devices: usize,
+    ops: usize,
 }
 
-/// One wallet, two merchants, one backend — the cast every scenario needs.
+/// A backend and one device per account, each account opened with the given
+/// online balance.
 struct World {
     issuer: Issuer,
-    alice: Wallet<StdRng>,
-    alice_id: WalletId,
-    bakery: Merchant<StdRng>,
-    kiosk: Merchant<StdRng>,
-    rng: StdRng,
+    accounts: Vec<AccountId>,
+    devices: Vec<Device>,
 }
 
-fn world(cfg: &Config, seed: u64) -> World {
+fn world(cfg: &Config, seed: u64, balances: &[u64]) -> World {
     let mut rng = StdRng::seed_from_u64(seed);
-    // The RSA key is generated once and shared: scenarios need independent
-    // ledgers, not independent issuer keys.
-    let mut issuer = Issuer::new(cfg.keypair.clone());
-    let public_key = issuer.public_key();
-    let alice_id = WalletId::from_bytes(rng.gen());
-    issuer.open_account(alice_id, cfg.opening_balance);
-    World {
-        alice: Wallet::new(
-            alice_id,
-            public_key.clone(),
-            StdRng::seed_from_u64(seed ^ 0xa1),
-        ),
-        alice_id,
-        bakery: Merchant::new(
-            *b"BAKERY01",
-            public_key.clone(),
-            StdRng::seed_from_u64(seed ^ 0xb2),
-        ),
-        kiosk: Merchant::new(*b"KIOSK_02", public_key, StdRng::seed_from_u64(seed ^ 0xc3)),
-        issuer,
-        rng,
+    // The issuer key is generated once and shared: scenarios need independent
+    // ledgers, not independent Eurosystems.
+    let mut issuer = Issuer::new(cfg.issuer_key.clone());
+    let mut accounts = Vec::new();
+    let mut devices = Vec::new();
+    for (index, balance) in balances.iter().enumerate() {
+        let account = AccountId(rng.gen());
+        issuer.open_account(account, *balance);
+        let device = enrol(
+            &mut issuer,
+            account,
+            cfg.limit,
+            cfg.key_bits,
+            StdRng::seed_from_u64(seed ^ (index as u64 + 1) << 32),
+            &mut rng,
+        )
+        .expect("enrolment of a known account");
+        accounts.push(account);
+        devices.push(device);
     }
+    World {
+        issuer,
+        accounts,
+        devices,
+    }
+}
+
+/// Two distinct devices, mutably, out of one vector.
+fn pair(devices: &mut [Device], a: usize, b: usize) -> (&mut Device, &mut Device) {
+    assert_ne!(a, b);
+    if a < b {
+        let (left, right) = devices.split_at_mut(b);
+        (&mut left[a], &mut right[0])
+    } else {
+        let (left, right) = devices.split_at_mut(a);
+        (&mut right[0], &mut left[b])
+    }
+}
+
+fn euros(cents: u64) -> String {
+    format!("{}.{:02} €", cents / 100, cents % 100)
 }
 
 // ───────────────────────────── scenarios ─────────────────────────────
 
-/// Fund, spend once, settle: the merchant is paid and the payer stays unnamed.
-fn honest_lifecycle(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed);
-    let start = w.issuer.balance_of(&w.alice_id).unwrap();
+/// The question that started this: pay 6 € out of 10 €, keep the 4 €.
+fn partial_payment_keeps_the_rest(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed, &[100_00, 0, 0]);
+    fund(&mut w.devices[0], &mut w.issuer, 10_00).map_err(|e| e.to_string())?;
 
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| format!("withdrawal failed: {e}"))?;
+    let (alice, bakery) = pair(&mut w.devices, 0, 1);
+    pay(alice, bakery, 6_00).map_err(|e| format!("6 € payment failed: {e}"))?;
+    ensure!(
+        alice.balance() == 4_00,
+        "Alice should keep 4 €, has {}",
+        euros(alice.balance())
+    );
+    ensure!(bakery.balance() == 6_00, "bakery should hold 6 €");
 
-    ensure!(
-        w.issuer.balance_of(&w.alice_id) == Some(start - cfg.amount),
-        "online account was not debited by the face value"
-    );
-    ensure!(
-        w.alice.offline_balance() == cfg.amount,
-        "offline balance should hold the new token"
-    );
-    ensure!(
-        w.issuer.outstanding_cents() == cfg.amount,
-        "issuer should carry the token as outstanding"
-    );
-
-    let request = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (token_copy, proof) = w
-        .alice
-        .pay(&token.payload.serial, &request)
-        .map_err(|e| format!("sealed element refused an honest payment: {e}"))?;
-    w.bakery
-        .accept(&request, token_copy, proof, NOW)
-        .map_err(|e| format!("merchant refused an honest payment: {e}"))?;
-    ensure!(
-        w.alice.offline_balance() == 0,
-        "spent token is still counted as available"
-    );
-
-    let receipts = w.bakery.drain_deposits();
-    ensure!(receipts.len() == 1, "expected exactly one pending receipt");
-    match w.issuer.redeem(&receipts[0]) {
-        Settlement::Credited { amount_cents } => ensure!(
-            amount_cents == cfg.amount,
-            "credited {amount_cents}c, expected {}c",
-            cfg.amount
-        ),
-        other => return Err(format!("expected Credited, got {other:?}")),
-    }
-    ensure!(
-        !w.issuer.is_suspended(&w.alice_id),
-        "an honest payer must not be suspended"
-    );
-    ensure!(
-        w.issuer.outstanding_cents() == 0,
-        "redeemed token still outstanding"
-    );
+    let (alice, kiosk) = pair(&mut w.devices, 0, 2);
+    pay(alice, kiosk, 4_00).map_err(|e| format!("spending the 4 € left failed: {e}"))?;
+    ensure!(alice.balance() == 0, "Alice should be empty");
+    ensure!(kiosk.balance() == 4_00, "kiosk should hold 4 €");
 
     note!(
         notes,
-        "serial {} settled for {}c",
-        hex(&token.payload.serial),
-        cfg.amount
-    );
-    note!(notes, "issuer learned the token, never the payer");
-    Ok(())
-}
-
-/// An intact secure element simply will not answer twice.
-fn sealed_element_refuses_a_replay(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 1);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let serial = token.payload.serial;
-
-    let first = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (t, p) = w.alice.pay(&serial, &first).map_err(|e| e.to_string())?;
-    w.bakery
-        .accept(&first, t, p, NOW)
-        .map_err(|e| e.to_string())?;
-
-    ensure!(
-        w.alice.state() == ElementState::Sealed,
-        "element should still be sealed"
-    );
-    let second = w
-        .kiosk
-        .request_payment(cfg.amount, NOW + 60)
-        .map_err(|e| e.to_string())?;
-    match w.alice.pay(&serial, &second) {
-        Err(Error::TokenAlreadySpent) => {
-            note!(notes, "second spend refused in hardware, before any maths");
-            Ok(())
-        }
-        Err(other) => Err(format!("expected TokenAlreadySpent, got {other}")),
-        Ok(_) => Err("a sealed element answered a second challenge".into()),
-    }
-}
-
-/// The whole point: two challenges on one token solve for the payer.
-fn double_spend_unmasks_the_payer(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 2);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let serial = token.payload.serial;
-
-    let first = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (t1, p1) = w.alice.pay(&serial, &first).map_err(|e| e.to_string())?;
-    w.bakery
-        .accept(&first, t1, p1.clone(), NOW)
-        .map_err(|e| e.to_string())?;
-
-    // Roll back the anti-replay state and spend the same token elsewhere.
-    w.alice.crack_secure_element();
-    let second = w
-        .kiosk
-        .request_payment(cfg.amount, NOW + 60)
-        .map_err(|e| e.to_string())?;
-    let (t2, p2) = w
-        .alice
-        .pay(&serial, &second)
-        .map_err(|e| format!("cracked element should answer again: {e}"))?;
-    w.kiosk
-        .accept(&second, t2, p2.clone(), NOW + 60)
-        .map_err(|e| format!("offline merchant cannot detect this, but refused: {e}"))?;
-    ensure!(
-        p1.challenge != p2.challenge,
-        "distinct transactions must yield distinct challenges"
-    );
-
-    let mut settlements = Vec::new();
-    for receipt in w.bakery.drain_deposits() {
-        settlements.push(w.issuer.redeem(&receipt));
-    }
-    for receipt in w.kiosk.drain_deposits() {
-        settlements.push(w.issuer.redeem(&receipt));
-    }
-
-    ensure!(
-        matches!(settlements[0], Settlement::Credited { .. }),
-        "first deposit should settle normally, got {:?}",
-        settlements[0]
-    );
-    let report = match &settlements[1] {
-        Settlement::DoubleSpend(report) => report,
-        other => return Err(format!("expected DoubleSpend, got {other:?}")),
-    };
-    let recovered = report
-        .culprit
-        .as_ref()
-        .map_err(|e| format!("solver produced no valid identity: {e}"))?;
-    ensure!(
-        *recovered == w.alice_id,
-        "recovered {recovered}, expected {}",
-        w.alice_id
-    );
-    ensure!(
-        report.account_known,
-        "recovered identity did not match a known account"
-    );
-    ensure!(
-        report.serial == serial,
-        "fraud report names the wrong serial"
-    );
-    ensure!(
-        w.issuer.is_suspended(&w.alice_id),
-        "double spender was not suspended"
-    );
-
-    // Confirm the algebra directly, independent of the issuer's bookkeeping.
-    let solved = recover_identity(&p1, &p2)
-        .ok_or("recover_identity refused two distinct challenges")?
-        .map_err(|e| e.to_string())?;
-    ensure!(
-        solved == w.alice_id,
-        "direct solve disagreed with the issuer"
-    );
-
-    note!(notes, "x1 = {}, x2 = {}", p1.challenge, p2.challenge);
-    note!(notes, "I = (y1-y2)(x1-x2)^-1 = {recovered}");
-    note!(notes, "account suspended, value clawed back");
-    Ok(())
-}
-
-/// Same token, same challenge: a retry, not fraud. Nobody gets named.
-fn repeated_challenge_keeps_the_payer_anonymous(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 3);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let serial = token.payload.serial;
-
-    let request = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    w.alice.crack_secure_element();
-    let (t1, p1) = w.alice.pay(&serial, &request).map_err(|e| e.to_string())?;
-    let (t2, p2) = w.alice.pay(&serial, &request).map_err(|e| e.to_string())?;
-    ensure!(p1 == p2, "the same challenge must give the same answer");
-
-    w.bakery
-        .accept(&request, t1, p1.clone(), NOW)
-        .map_err(|e| e.to_string())?;
-    w.bakery
-        .accept(&request, t2, p2.clone(), NOW)
-        .map_err(|e| e.to_string())?;
-    let receipts = w.bakery.drain_deposits();
-    ensure!(receipts.len() == 2, "expected two receipts");
-
-    ensure!(
-        matches!(w.issuer.redeem(&receipts[0]), Settlement::Credited { .. }),
-        "first deposit should be credited"
-    );
-    match w.issuer.redeem(&receipts[1]) {
-        Settlement::DuplicateDeposit => {}
-        other => return Err(format!("expected DuplicateDeposit, got {other:?}")),
-    }
-    ensure!(
-        !w.issuer.is_suspended(&w.alice_id),
-        "a duplicate deposit must not suspend anyone"
-    );
-    ensure!(
-        recover_identity(&p1, &p2).is_none(),
-        "two points on the same abscissa must not yield an identity"
-    );
-
-    note!(
-        notes,
-        "paid once, deposited twice — no identity extractable"
+        "10 € funded, 6 € to the bakery, the 4 € left spent at the kiosk"
     );
     Ok(())
 }
 
-/// A wallet that lies about its identity is caught unless it survives the cut.
-fn cut_and_choose_catches_a_forged_identity(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 4);
-    let public_key = w.issuer.public_key();
-    let (mut request, session) = w
-        .alice
-        .begin_withdrawal(cfg.amount, EXPIRY, cfg.candidates)
-        .map_err(|e| e.to_string())?;
+/// Money received offline can be paid on at once, still offline.
+fn received_value_is_respendable(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 1, &[100_00, 0, 0]);
+    fund(&mut w.devices[0], &mut w.issuer, 10_00).map_err(|e| e.to_string())?;
+    let float = w.issuer.offline_float();
 
-    let cut = w
-        .issuer
-        .cut(&request, &mut w.rng)
-        .map_err(|e| e.to_string())?;
-    // Forge a candidate the issuer is certain to open.
-    let target = (cut.keep + 1) % cfg.candidates;
-    let (candidate, forged) = forged_candidate(cfg, &public_key, &mut w.rng);
-    request.candidates[target] = candidate;
+    let (alice, bakery) = pair(&mut w.devices, 0, 1);
+    pay(alice, bakery, 6_00).map_err(|e| e.to_string())?;
+    let (bakery, supplier) = pair(&mut w.devices, 1, 2);
+    pay(bakery, supplier, 5_00).map_err(|e| format!("bakery could not re-spend: {e}"))?;
+    let (supplier, alice) = pair(&mut w.devices, 2, 0);
+    pay(supplier, alice, 2_00).map_err(|e| format!("supplier could not re-spend: {e}"))?;
 
-    let mut opening = w
-        .alice
-        .answer_cut(&session, &cut)
-        .map_err(|e| e.to_string())?;
-    let slot = opening
-        .openings
-        .iter_mut()
-        .find(|(index, _)| *index == target)
-        .ok_or("the forged candidate should be among the opened ones")?;
-    slot.1 = forged;
-
-    match w.issuer.issue(&request, &cut, &opening) {
-        Err(Error::IdentityNotEmbedded { index }) => {
-            ensure!(index == target, "blamed candidate {index}, forged {target}");
-            note!(
-                notes,
-                "candidate {target} opened: slopes were not the account identity"
-            );
-            Ok(())
-        }
-        Err(other) => Err(format!("expected IdentityNotEmbedded, got {other}")),
-        Ok(_) => Err("the issuer signed a token with a forged identity".into()),
-    }
-}
-
-/// One point per line excludes no slope at all — that is the secrecy claim.
-fn one_point_hides_every_slope(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 5);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let request = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (_, proof) = w
-        .alice
-        .pay(&token.payload.serial, &request)
-        .map_err(|e| e.to_string())?;
-
-    // For any slope whatsoever there is exactly one intercept through the
-    // observed point, so a single observation rules nothing out.
-    let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0xfeed);
-    let samples = 2000;
-    for _ in 0..samples {
-        for limb in 0..LIMBS {
-            let y = proof.response[limb];
-            let candidate_slope = Fp::random(&mut rng);
-            let implied_intercept = y.sub(candidate_slope.mul(proof.challenge));
-            ensure!(
-                candidate_slope.mul(proof.challenge).add(implied_intercept) == y,
-                "limb {limb}: no intercept fits an admissible slope"
-            );
-        }
-    }
+    let total: u64 = w.devices.iter().map(Device::balance).sum();
     ensure!(
-        !proof.challenge.is_zero(),
-        "x = 0 must never be issued: f(0) = s leaks only the intercept"
+        total == 10_00,
+        "value not conserved: {} on devices",
+        euros(total)
     );
-
-    note!(
-        notes,
-        "{samples} slopes per limb tried; every one stays consistent"
-    );
-    Ok(())
-}
-
-/// Offline terminals still catch anything the signature covers.
-fn merchant_rejects_a_tampered_token(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 6);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let request = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (mut tampered, proof) = w
-        .alice
-        .pay(&token.payload.serial, &request)
-        .map_err(|e| e.to_string())?;
-
-    tampered.payload.commitment[0] ^= 0xff;
-    match w.bakery.accept(&request, tampered, proof, NOW) {
-        Err(Error::InvalidTokenSignature) => {
-            note!(
-                notes,
-                "commitment flipped, blind signature no longer verifies"
-            );
-            Ok(())
-        }
-        Err(other) => Err(format!("expected InvalidTokenSignature, got {other}")),
-        Ok(_) => Err("terminal accepted a token with a rewritten commitment".into()),
-    }
-}
-
-/// A sale the element will not honour — wrong amount, or past expiry — is
-/// refused before any point leaves the element, so it costs the payer nothing.
-fn refused_sale_does_not_burn_the_token(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 7);
-    let token = withdraw(
-        &mut w.alice,
-        &mut w.issuer,
-        cfg.amount,
-        EXPIRY,
-        cfg.candidates,
-        &mut w.rng,
-    )
-    .map_err(|e| e.to_string())?;
-    let serial = token.payload.serial;
-
-    let short = w
-        .bakery
-        .request_payment(cfg.amount - 1, NOW)
-        .map_err(|e| e.to_string())?;
-    match w.alice.pay(&serial, &short) {
-        Err(Error::AmountMismatch { .. }) => {}
-        Err(other) => return Err(format!("expected AmountMismatch, got {other}")),
-        Ok(_) => return Err("element answered a request for the wrong amount".into()),
-    }
-
-    let late = EXPIRY + 1;
-    let stale = w
-        .bakery
-        .request_payment(cfg.amount, late)
-        .map_err(|e| e.to_string())?;
-    match w.alice.pay(&serial, &stale) {
-        Err(Error::Expired { expiry, now }) => ensure!(
-            expiry == EXPIRY && now == late,
-            "wrong expiry values reported"
-        ),
-        Err(other) => return Err(format!("expected Expired, got {other}")),
-        Ok(_) => return Err("element answered after expiry".into()),
-    }
-
     ensure!(
-        w.alice.offline_balance() == cfg.amount,
-        "a refused sale cost the payer the token"
-    );
-    let exact = w
-        .bakery
-        .request_payment(cfg.amount, NOW)
-        .map_err(|e| e.to_string())?;
-    let (t, p) = w
-        .alice
-        .pay(&serial, &exact)
-        .map_err(|e| format!("token unusable after a refused sale: {e}"))?;
-    w.bakery
-        .accept(&exact, t, p, NOW)
-        .map_err(|e| e.to_string())?;
-
-    note!(notes, "wrong amount and expired sale refused, token intact");
-    note!(notes, "the exact payment afterwards went through");
-    Ok(())
-}
-
-/// Noise instead of honest answers must not frame an innocent account.
-fn garbage_answers_accuse_nobody(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut rng = StdRng::seed_from_u64(cfg.seed + 8);
-    let attempts = 1000;
-    let mut framed = 0usize;
-    for _ in 0..attempts {
-        let first = SpendProof {
-            challenge: Fp::random(&mut rng),
-            response: [(); LIMBS].map(|_| Fp::random(&mut rng)),
-        };
-        let second = SpendProof {
-            challenge: Fp::random(&mut rng),
-            response: [(); LIMBS].map(|_| Fp::random(&mut rng)),
-        };
-        if first.challenge == second.challenge {
-            continue;
-        }
-        let recovered =
-            recover_identity(&first, &second).ok_or("distinct challenges should be solvable")?;
-        if recovered.is_ok() {
-            framed += 1;
-        }
-    }
-    // Every limb would have to land inside its 52-bit budget by chance:
-    // (2^52/p)^5 is about 2^-45.
-    ensure!(
-        framed == 0,
-        "{framed} of {attempts} random answer pairs decoded to a well-formed identity"
+        w.issuer.offline_float() == float,
+        "the issuer's view changed during offline payments"
     );
     note!(
         notes,
-        "{attempts} random pairs, none decoded to a valid identity"
+        "alice -> bakery -> supplier -> alice, all offline, 10 € conserved"
     );
+    note!(notes, "the issuer's books did not move");
     Ok(())
 }
 
-/// Many tokens, two merchants: no cent is created or destroyed.
-fn ledger_conserves_value(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 9);
-    let start = w.issuer.balance_of(&w.alice_id).unwrap();
-    let count = 4usize;
+/// A payment the payer's element refuses costs neither side anything.
+fn refused_payment_costs_nothing(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 2, &[100_00, 0]);
+    fund(&mut w.devices[0], &mut w.issuer, 5_00).map_err(|e| e.to_string())?;
 
-    let mut serials = Vec::new();
-    for _ in 0..count {
-        let token = withdraw(
-            &mut w.alice,
-            &mut w.issuer,
-            cfg.amount,
-            EXPIRY,
-            cfg.candidates,
-            &mut w.rng,
-        )
-        .map_err(|e| format!("withdrawal failed: {e}"))?;
-        serials.push(token.payload.serial);
-    }
-    let funded = count as u64 * cfg.amount;
-    ensure!(
-        w.issuer.balance_of(&w.alice_id) == Some(start - funded),
-        "online balance does not reflect {count} withdrawals"
-    );
-    ensure!(
-        w.issuer.outstanding_cents() == funded,
-        "outstanding float should be {funded}c"
-    );
-    ensure!(
-        w.alice.offline_balance() == funded,
-        "offline balance should be {funded}c"
-    );
-
-    // Spend each token once, alternating between the two terminals.
-    for (index, serial) in serials.iter().enumerate() {
-        let timestamp = NOW + index as u64 * 37;
-        let accepted = if index % 2 == 0 {
-            let r = w
-                .bakery
-                .request_payment(cfg.amount, timestamp)
-                .map_err(|e| e.to_string())?;
-            ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w.alice.pay(serial, &r).map_err(|e| e.to_string())?;
-            w.bakery.accept(&r, t, p, timestamp)
-        } else {
-            let r = w
-                .kiosk
-                .request_payment(cfg.amount, timestamp)
-                .map_err(|e| e.to_string())?;
-            ensure!(!r.challenge.is_zero(), "degenerate challenge issued");
-            let (t, p) = w.alice.pay(serial, &r).map_err(|e| e.to_string())?;
-            w.kiosk.accept(&r, t, p, timestamp)
-        };
-        accepted.map_err(|e| format!("payment {index} refused: {e}"))?;
-    }
-    ensure!(w.alice.offline_balance() == 0, "all tokens should be spent");
-
-    let mut credited = 0u64;
-    for receipt in w
-        .bakery
-        .drain_deposits()
-        .into_iter()
-        .chain(w.kiosk.drain_deposits())
-    {
-        match w.issuer.redeem(&receipt) {
-            Settlement::Credited { amount_cents } => credited += amount_cents,
-            other => return Err(format!("honest deposit did not settle: {other:?}")),
-        }
-    }
-
-    let remaining = w.issuer.balance_of(&w.alice_id).unwrap();
-    ensure!(
-        credited == funded,
-        "merchants were credited {credited}c, funded {funded}c"
-    );
-    ensure!(
-        w.issuer.outstanding_cents() == 0,
-        "float did not unwind to zero"
-    );
-    ensure!(
-        remaining + credited == start,
-        "conservation broken: {remaining}c on account + {credited}c credited != {start}c"
-    );
-    ensure!(
-        !w.issuer.is_suspended(&w.alice_id),
-        "honest payer suspended"
-    );
-
-    note!(
-        notes,
-        "{count} tokens issued and settled across 2 terminals"
-    );
-    note!(
-        notes,
-        "{remaining}c on account + {credited}c credited = {start}c"
-    );
-    Ok(())
-}
-
-/// Unknown accounts and overdrafts never reach the signing step.
-fn funding_requires_a_funded_account(cfg: &Config, notes: &mut Notes) -> Outcome {
-    let mut w = world(cfg, cfg.seed + 10);
-
-    let (too_big, _) = w
-        .alice
-        .begin_withdrawal(cfg.opening_balance + 1, EXPIRY, cfg.candidates)
-        .map_err(|e| e.to_string())?;
-    match w.issuer.cut(&too_big, &mut w.rng) {
+    let (alice, bakery) = pair(&mut w.devices, 0, 1);
+    match pay(alice, bakery, 6_00) {
         Err(Error::InsufficientFunds { .. }) => {}
         other => return Err(format!("expected InsufficientFunds, got {other:?}")),
     }
-
-    let stranger_id = WalletId::from_bytes([9u8; 32]);
-    let mut stranger = Wallet::new(
-        stranger_id,
-        w.issuer.public_key(),
-        StdRng::seed_from_u64(77),
+    ensure!(
+        alice.balance() == 5_00,
+        "payer was debited for a refused payment"
     );
-    let (request, _) = stranger
-        .begin_withdrawal(cfg.amount, EXPIRY, cfg.candidates)
-        .map_err(|e| e.to_string())?;
-    match w.issuer.cut(&request, &mut w.rng) {
-        Err(Error::UnknownAccount(_)) => {}
-        other => return Err(format!("expected UnknownAccount, got {other:?}")),
+    ensure!(
+        bakery.reserved() == 0,
+        "payee kept a reservation for a dead request"
+    );
+
+    // A payee whose certificate the Eurosystem never signed gets nothing.
+    let mut request = bakery.request_payment(1_00).map_err(|e| e.to_string())?;
+    request.payee = rogue_certificate(cfg);
+    match alice.pay(&request) {
+        Err(Error::InvalidCertificate) => {}
+        other => return Err(format!("expected InvalidCertificate, got {other:?}")),
     }
+    ensure!(alice.balance() == 5_00, "payer paid an uncertified device");
 
     note!(
         notes,
-        "overdraft and unknown-account withdrawals both refused"
+        "overdraft and uncertified payee both refused before any debit"
     );
     Ok(())
 }
 
-// ─────────────────────────── forgery helper ───────────────────────────
+fn rogue_certificate(cfg: &Config) -> DeviceCertificate {
+    let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x0bad);
+    let mut rogue = Issuer::new(Keypair::generate(512, &mut rng));
+    let account = AccountId([0xee; 16]);
+    rogue.open_account(account, 0);
+    let key = Keypair::generate(512, &mut rng);
+    rogue
+        .certify_device(account, &key.public, cfg.limit, &mut rng)
+        .expect("rogue certification")
+}
 
-/// Builds a candidate whose lines carry slopes that are *not* the account's
-/// identity, together with the opening that would reveal them.
-fn forged_candidate<R: Rng + ?Sized>(
-    cfg: &Config,
-    public_key: &IssuerPublicKey,
-    rng: &mut R,
-) -> (Candidate, CandidateOpening) {
-    let mut coefficients = [(Fp::ZERO, Fp::ZERO); LIMBS];
-    for slot in coefficients.iter_mut() {
-        *slot = (Fp::random(rng), Fp::random(rng));
+/// The payee's holding limit is enforced before the payer is debited.
+fn holding_limit_checked_before_debit(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 3, &[cfg.limit, cfg.limit]);
+    fund(&mut w.devices[0], &mut w.issuer, cfg.limit).map_err(|e| e.to_string())?;
+    fund(&mut w.devices[1], &mut w.issuer, cfg.limit - 1_00).map_err(|e| e.to_string())?;
+
+    let (alice, bakery) = pair(&mut w.devices, 0, 1);
+    match pay(alice, bakery, 2_00) {
+        Err(Error::HoldingLimitExceeded { headroom, .. }) => {
+            ensure!(headroom == 1_00, "headroom reported as {headroom}")
+        }
+        other => return Err(format!("expected HoldingLimitExceeded, got {other:?}")),
     }
-    let lines = SecretLines {
-        coefficients,
-        nonce: rng.gen(),
-    };
-    let payload = TokenPayload {
-        serial: rng.gen(),
-        amount_cents: cfg.amount,
-        expiry_epoch: EXPIRY,
-        commitment: lines.commitment(),
-    };
-    let blinding_factor = public_key.blinding_factor(rng);
-    let blinded_message = public_key.blind(&payload.digest(), &blinding_factor);
-    (
-        Candidate {
-            commitment: payload.commitment,
-            blinded_message,
-        },
-        CandidateOpening {
-            payload,
-            lines,
-            blinding_factor,
-        },
-    )
+    ensure!(alice.balance() == cfg.limit, "payer was debited anyway");
+    pay(alice, bakery, 1_00).map_err(|e| format!("payment within headroom refused: {e}"))?;
+    ensure!(
+        bakery.balance() == cfg.limit,
+        "bakery should now be exactly at its limit"
+    );
+
+    note!(
+        notes,
+        "2 € refused with 1 € of room; 1 € accepted, bakery at its limit"
+    );
+    Ok(())
+}
+
+/// Replaying or tampering with a transfer gains nothing.
+fn transfers_resist_replay_and_tampering(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 4, &[100_00, 0, 0]);
+    fund(&mut w.devices[0], &mut w.issuer, 10_00).map_err(|e| e.to_string())?;
+
+    let request = w.devices[1]
+        .request_payment(6_00)
+        .map_err(|e| e.to_string())?;
+    let transfer = w.devices[0].pay(&request).map_err(|e| e.to_string())?;
+
+    let mut inflated = transfer.clone();
+    inflated.amount_cents = 60_00;
+    ensure!(
+        w.devices[1].receive(&inflated) == Err(Error::InvalidSignature),
+        "an inflated transfer was not rejected"
+    );
+    let mut redirected = transfer.clone();
+    redirected.payee = w.devices[2].device();
+    ensure!(
+        w.devices[2].receive(&redirected) == Err(Error::InvalidSignature),
+        "a redirected transfer was not rejected"
+    );
+    ensure!(
+        w.devices[1].receive(&transfer) == Ok(6_00),
+        "the genuine transfer was not credited"
+    );
+    ensure!(
+        w.devices[1].receive(&transfer) == Err(Error::AlreadyCredited),
+        "a replayed transfer was not refused"
+    );
+    ensure!(
+        w.devices[1].balance() == 6_00,
+        "payee credited more than once"
+    );
+
+    note!(
+        notes,
+        "inflated and redirected copies rejected; the replay credited nothing"
+    );
+    Ok(())
+}
+
+/// Value goes back online, and a defunding order cannot be cashed twice.
+fn defunding_round_trip(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 5, &[100_00]);
+    let account = w.accounts[0];
+    fund(&mut w.devices[0], &mut w.issuer, 30_00).map_err(|e| e.to_string())?;
+    let order = w.devices[0].defund(12_00).map_err(|e| e.to_string())?;
+    ensure!(w.issuer.defund(&order) == Ok(12_00), "defunding refused");
+    ensure!(
+        w.issuer.defund(&order) == Err(Error::Replay),
+        "a defunding order was cashed twice"
+    );
+    ensure!(
+        w.issuer.balance_of(&account) == Some(82_00),
+        "account should hold 82 €, holds {:?}",
+        w.issuer.balance_of(&account)
+    );
+    ensure!(w.issuer.offline_float() == 18_00, "float should be 18 €");
+    note!(notes, "30 € funded, 12 € defunded, replayed order refused");
+    Ok(())
+}
+
+/// No recovery: a lost device takes its balance with it.
+fn lost_device_strands_its_balance(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 6, &[100_00]);
+    let account = w.accounts[0];
+    fund(&mut w.devices[0], &mut w.issuer, 40_00).map_err(|e| e.to_string())?;
+    w.devices.clear(); // dropped in the river
+    ensure!(
+        w.issuer.balance_of(&account) == Some(60_00),
+        "the account was made whole"
+    );
+    ensure!(
+        w.issuer.offline_float() == 40_00,
+        "the lost value should stay counted as offline"
+    );
+    note!(
+        notes,
+        "40 € gone with the device; the float carries it forever"
+    );
+    Ok(())
+}
+
+/// A cracked element pays out value it does not have. Offline nobody can
+/// tell; online it shows up only in aggregate, with no pointer to the source.
+fn cracked_element_counterfeits(cfg: &Config, notes: &mut Notes) -> Outcome {
+    let mut w = world(cfg, cfg.seed + 7, &[100_00, 0, 0]);
+    fund(&mut w.devices[0], &mut w.issuer, 10_00).map_err(|e| e.to_string())?;
+    w.devices[0].crack_secure_element();
+
+    for payee in [1, 2] {
+        let (mallory, victim) = pair(&mut w.devices, 0, payee);
+        pay(mallory, victim, 10_00)
+            .map_err(|e| format!("payee {payee} refused a genuine-looking transfer: {e}"))?;
+    }
+    let circulating = w.devices[1].balance() + w.devices[2].balance();
+    ensure!(
+        circulating == 20_00,
+        "expected 20 € in circulation from 10 € funded"
+    );
+
+    for payee in [1, 2] {
+        defund(&mut w.devices[payee], &mut w.issuer, 10_00)
+            .map_err(|e| format!("defunding refused: {e}"))?;
+    }
+    ensure!(
+        w.issuer.offline_float() == -10_00,
+        "float should be -10 €, is {}",
+        w.issuer.offline_float()
+    );
+    ensure!(
+        w.devices[0].balance() == 10_00,
+        "the cracked element should still show its 10 €"
+    );
+    note!(
+        notes,
+        "10 € funded; 20 € paid out and defunded, 10 € still on the element"
+    );
+    note!(
+        notes,
+        "20 € created; the -10 € float shows it happened, not where"
+    );
+    Ok(())
 }
 
 // ──────────────────────────── commands ────────────────────────────
@@ -762,43 +366,31 @@ fn forged_candidate<R: Rng + ?Sized>(
 fn run_check(cfg: &Config) -> bool {
     let scenarios: &[(&str, Scenario)] = &[
         (
-            "honest lifecycle settles and stays anonymous",
-            honest_lifecycle,
+            "pay 6 € of 10 €, keep and spend the 4 €",
+            partial_payment_keeps_the_rest,
         ),
         (
-            "sealed element refuses a replay",
-            sealed_element_refuses_a_replay,
+            "received value is re-spendable offline",
+            received_value_is_respendable,
         ),
         (
-            "double spend unmasks the payer",
-            double_spend_unmasks_the_payer,
+            "refused payment costs nothing",
+            refused_payment_costs_nothing,
         ),
         (
-            "repeated challenge keeps the payer anonymous",
-            repeated_challenge_keeps_the_payer_anonymous,
+            "holding limit checked before debit",
+            holding_limit_checked_before_debit,
         ),
         (
-            "cut-and-choose catches a forged identity",
-            cut_and_choose_catches_a_forged_identity,
+            "transfers resist replay and tampering",
+            transfers_resist_replay_and_tampering,
         ),
-        ("one point hides every slope", one_point_hides_every_slope),
+        ("defunding round trip", defunding_round_trip),
         (
-            "terminal rejects a tampered token",
-            merchant_rejects_a_tampered_token,
+            "lost device strands its balance",
+            lost_device_strands_its_balance,
         ),
-        (
-            "refused sale does not burn the token",
-            refused_sale_does_not_burn_the_token,
-        ),
-        (
-            "garbage answers accuse nobody",
-            garbage_answers_accuse_nobody,
-        ),
-        ("ledger conserves value", ledger_conserves_value),
-        (
-            "funding requires a funded account",
-            funding_requires_a_funded_account,
-        ),
+        ("cracked element counterfeits", cracked_element_counterfeits),
     ];
 
     println!("acceptance scenarios");
@@ -807,12 +399,12 @@ fn run_check(cfg: &Config) -> bool {
         let mut notes = Notes::new();
         let started = Instant::now();
         let outcome = scenario(cfg, &mut notes);
-        let elapsed = started.elapsed();
+        let elapsed = started.elapsed().as_millis();
         match outcome {
-            Ok(()) => println!("  PASS  {name}  ({} ms)", elapsed.as_millis()),
+            Ok(()) => println!("  PASS  {name}  ({elapsed} ms)"),
             Err(why) => {
                 failed += 1;
-                println!("  FAIL  {name}  ({} ms)", elapsed.as_millis());
+                println!("  FAIL  {name}  ({elapsed} ms)");
                 println!("          -> {why}");
             }
         }
@@ -820,144 +412,142 @@ fn run_check(cfg: &Config) -> bool {
             println!("          {line}");
         }
     }
-
     let total = scenarios.len();
     println!("\n  {} passed, {failed} failed, of {total}", total - failed);
     failed == 0
 }
 
-/// A cheating wallet forges exactly one of `n` candidates and wins only if the
-/// issuer happens to keep that one, so the escape rate should sit near `1/n`.
-fn run_soundness(cfg: &Config) -> bool {
-    let n = cfg.candidates;
-    let trials = cfg.trials;
-    println!("cut-and-choose soundness: {trials} forgery attempts, n = {n}");
-
-    let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x5011d);
-    let mut issuer = Issuer::new(cfg.keypair.clone());
-    let public_key = issuer.public_key();
-    let alice_id = WalletId::from_bytes(rng.gen());
-    let mut alice = Wallet::new(
-        alice_id,
-        public_key.clone(),
-        StdRng::seed_from_u64(cfg.seed ^ 0xbad),
-    );
-
-    let mut escaped = 0usize;
-    let mut caught = 0usize;
+/// Random fundings, payments, and defundings across many honest devices,
+/// with every invariant checked after every operation:
+///
+/// * no device ever exceeds its holding limit;
+/// * value on devices equals the issuer's offline float;
+/// * online balances plus the float equal the money that existed at the start;
+/// * a refused operation changes nothing, anywhere.
+fn run_fuzz(cfg: &Config) -> bool {
+    let n = cfg.devices;
+    println!("fuzz: {} operations across {n} devices", cfg.ops);
     let started = Instant::now();
+    let opening = 3 * cfg.limit / 2;
+    let mut w = world(cfg, cfg.seed ^ 0xf022, &vec![opening; n]);
+    let money = opening as u128 * n as u128;
+    let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x5eed);
+    let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
 
-    for trial in 0..trials {
-        // Fresh funds each trial, so an escape never starves the next one.
-        issuer.open_account(alice_id, cfg.opening_balance);
-
-        let (mut request, session) = match alice.begin_withdrawal(cfg.amount, EXPIRY, n) {
-            Ok(pair) => pair,
-            Err(error) => {
-                println!("  trial {trial} aborted: {error}");
-                return false;
+    for step in 0..cfg.ops {
+        let before = snapshot(&w);
+        let a = rng.gen_range(0..n);
+        // Amounts up to half the limit, so every kind of refusal gets hit.
+        let amount = rng.gen_range(1..=cfg.limit / 2);
+        let (kind, result) = match rng.gen_range(0..10) {
+            0..=1 => ("fund", fund(&mut w.devices[a], &mut w.issuer, amount)),
+            2 => ("defund", defund(&mut w.devices[a], &mut w.issuer, amount)),
+            _ => {
+                let b = (a + rng.gen_range(1..n)) % n;
+                let (payer, payee) = pair(&mut w.devices, a, b);
+                ("pay", pay(payer, payee, amount))
             }
         };
-
-        // The forged candidate is chosen before the issuer cuts.
-        let target = rng.gen_range(0..n);
-        let (candidate, forged) = forged_candidate(cfg, &public_key, &mut rng);
-        request.candidates[target] = candidate;
-
-        let cut = match issuer.cut(&request, &mut rng) {
-            Ok(cut) => cut,
+        let label = match &result {
+            Ok(_) => format!("{kind}: ok"),
             Err(error) => {
-                println!("  trial {trial} aborted: {error}");
-                return false;
+                if snapshot(&w) != before {
+                    println!("  FAIL at step {step}: refused {kind} ({error}) changed state");
+                    return false;
+                }
+                let name = format!("{error:?}");
+                let name = name.split([' ', '{', '(']).next().unwrap_or("").to_string();
+                format!("{kind}: refused, {name}")
             }
         };
-        let mut opening = match alice.answer_cut(&session, &cut) {
-            Ok(opening) => opening,
-            Err(error) => {
-                println!("  trial {trial} aborted: {error}");
-                return false;
-            }
-        };
-        if cut.keep != target {
-            match opening.openings.iter_mut().find(|(i, _)| *i == target) {
-                Some(slot) => slot.1 = forged,
-                None => {
-                    println!("  trial {trial} aborted: forged candidate was not opened");
-                    return false;
-                }
-            }
-        }
+        *outcomes.entry(label).or_default() += 1;
 
-        match issuer.issue(&request, &cut, &opening) {
-            Ok(_) => {
-                escaped += 1;
-                if cut.keep != target {
-                    println!("  UNSOUND: an opened forgery was signed on trial {trial}");
-                    return false;
-                }
-            }
-            Err(_) => {
-                caught += 1;
-                if cut.keep == target {
-                    println!("  unexpected: an unopened candidate was rejected on trial {trial}");
-                    return false;
-                }
-            }
+        if let Err(why) = check_invariants(&w, cfg.limit, money) {
+            println!("  FAIL at step {step} after {kind}: {why}");
+            return false;
         }
     }
 
-    let observed = escaped as f64 / trials as f64;
-    let expected = 1.0 / n as f64;
-    // Four standard deviations of a Binomial(trials, 1/n) count.
-    let sigma = (trials as f64 * expected * (1.0 - expected)).sqrt();
-    let tolerance = 4.0 * sigma / trials as f64;
-    let within = (observed - expected).abs() <= tolerance;
-
+    for (label, count) in &outcomes {
+        println!("  {count:>6}  {label}");
+    }
+    let on_devices: u64 = w.devices.iter().map(Device::balance).sum();
     println!(
-        "  caught {caught}, escaped {escaped}  ({} ms)",
+        "  final: {} on devices, float {} cents  ({} ms)",
+        euros(on_devices),
+        w.issuer.offline_float(),
         started.elapsed().as_millis()
     );
-    println!("  observed escape rate {observed:.4}, expected 1/n = {expected:.4}");
-    println!(
-        "  4-sigma band +/-{tolerance:.4}  ->  {}",
-        if within { "consistent" } else { "OUT OF BAND" }
-    );
-    println!("  every escape was an unopened candidate; every opened forgery was caught");
-    if !within {
-        println!("\n  FAIL: escape rate inconsistent with the 1/n bound");
+    println!("  every invariant held after every operation");
+    true
+}
+
+/// Balances and reservations of every device, and every online account.
+fn snapshot(w: &World) -> (Vec<(u64, u64)>, Vec<Option<u64>>, i128) {
+    (
+        w.devices
+            .iter()
+            .map(|d| (d.balance(), d.reserved()))
+            .collect(),
+        w.accounts.iter().map(|a| w.issuer.balance_of(a)).collect(),
+        w.issuer.offline_float(),
+    )
+}
+
+fn check_invariants(w: &World, limit: u64, money: u128) -> Outcome {
+    for (index, device) in w.devices.iter().enumerate() {
+        ensure!(
+            device.balance() <= limit,
+            "device {index} holds {} over a {} limit",
+            device.balance(),
+            limit
+        );
+        ensure!(device.reserved() == 0, "device {index} kept a reservation");
     }
-    within
+    let on_devices: u128 = w.devices.iter().map(|d| d.balance() as u128).sum();
+    ensure!(
+        on_devices as i128 == w.issuer.offline_float(),
+        "{on_devices} on devices but float says {}",
+        w.issuer.offline_float()
+    );
+    let online: u128 = w
+        .accounts
+        .iter()
+        .map(|a| w.issuer.balance_of(a).unwrap_or(0) as u128)
+        .sum();
+    ensure!(
+        online + on_devices == money,
+        "money supply moved: {online} online + {on_devices} offline != {money}"
+    );
+    Ok(())
 }
 
 // ───────────────────────────── plumbing ─────────────────────────────
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn usage() {
     println!(
-        "digital-euro-wallet - offline digital euro protocol harness
+        "digital-euro-wallet - offline digital euro harness
 
 USAGE:
     digital-euro-wallet [COMMAND] [OPTIONS]
 
 COMMANDS:
     check        Run every acceptance scenario and report PASS/FAIL (default)
-    soundness    Measure the cut-and-choose forgery escape rate against 1/n
-    all          check, then soundness
+    fuzz         Random fundings, payments, and defundings; invariants checked
+                 after every operation
+    all          check, then fuzz
 
 OPTIONS:
-    --seed <N>          RNG seed                        (default 2026)
-    --key-bits <N>      RSA modulus size in bits        (default 2048)
-    --candidates <N>    cut-and-choose candidates, n    (default 20)
-    --amount <CENTS>    token face value                (default 1000)
-    --balance <CENTS>   opening online balance          (default 100000)
-    --trials <N>        forgery attempts for soundness  (default 200)
+    --seed <N>          RNG seed                               (default 2026)
+    --key-bits <N>      RSA modulus size for issuer and devices (default 2048)
+    --limit <CENTS>     per-device offline holding limit        (default 50000)
+    --devices <N>       devices in the fuzz run                 (default 6)
+    --ops <N>           operations in the fuzz run              (default 400)
     -h, --help          Show this message
 
+The holding limit is a parameter of the model, not a figure from the ECB.
 Exit code is 0 when everything passes, 1 otherwise.
-For a narrated single run: cargo run --release --example offline_payment"
+For a narrated run: cargo run --release --example offline_payment"
     );
 }
 
@@ -966,10 +556,9 @@ fn main() -> ExitCode {
     let mut command = "check";
     let mut seed = 2026u64;
     let mut key_bits = 2048u64;
-    let mut candidates = 20usize;
-    let mut amount = 10_00u64;
-    let mut balance = 1000_00u64;
-    let mut trials = 200usize;
+    let mut limit = 500_00u64;
+    let mut devices = 6usize;
+    let mut ops = 400usize;
 
     let mut index = 0;
     while index < args.len() {
@@ -980,9 +569,9 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "check" => command = "check",
-            "soundness" => command = "soundness",
+            "fuzz" => command = "fuzz",
             "all" => command = "all",
-            "--seed" | "--key-bits" | "--candidates" | "--amount" | "--balance" | "--trials" => {
+            "--seed" | "--key-bits" | "--limit" | "--devices" | "--ops" => {
                 let raw = match args.get(index + 1) {
                     Some(raw) => raw,
                     None => {
@@ -1000,10 +589,9 @@ fn main() -> ExitCode {
                 match arg {
                     "--seed" => seed = parsed,
                     "--key-bits" => key_bits = parsed,
-                    "--candidates" => candidates = parsed as usize,
-                    "--amount" => amount = parsed,
-                    "--balance" => balance = parsed,
-                    "--trials" => trials = parsed as usize,
+                    "--limit" => limit = parsed,
+                    "--devices" => devices = parsed as usize,
+                    "--ops" => ops = parsed as usize,
                     _ => unreachable!(),
                 }
                 index += 1;
@@ -1017,51 +605,47 @@ fn main() -> ExitCode {
         index += 1;
     }
 
-    if candidates < 2 {
-        eprintln!("error: --candidates must be at least 2");
+    if key_bits < 512 || key_bits % 2 != 0 {
+        eprintln!("error: --key-bits must be even and at least 512");
         return ExitCode::FAILURE;
     }
-    if key_bits < 512 {
-        eprintln!("error: --key-bits must be at least 512");
+    if limit < 20_00 {
+        eprintln!("error: --limit must be at least 2000 cents (the scenarios pay up to 20 €)");
         return ExitCode::FAILURE;
     }
-    if trials < 1 {
-        eprintln!("error: --trials must be at least 1");
-        return ExitCode::FAILURE;
-    }
-    if amount == 0 || balance < amount {
-        eprintln!("error: --amount must be non-zero and --balance at least --amount");
+    if devices < 2 {
+        eprintln!("error: --devices must be at least 2");
         return ExitCode::FAILURE;
     }
 
-    println!("digital euro wallet - offline e-cash harness");
-    print!("  generating the issuer's RSA-{key_bits} blind signing key ... ");
+    println!("digital euro wallet - offline harness");
+    print!("  generating the Eurosystem's RSA-{key_bits} key ... ");
     let _ = std::io::stdout().flush();
     let started = Instant::now();
-    let mut key_rng = StdRng::seed_from_u64(seed);
-    let keypair = IssuerKeypair::generate(key_bits, &mut key_rng);
+    let issuer_key = Keypair::generate(key_bits, &mut StdRng::seed_from_u64(seed));
     println!("done in {} ms", started.elapsed().as_millis());
     println!(
-        "  seed {seed}, n = {candidates} candidates, {amount}c tokens, {balance}c opening balance\n"
+        "  seed {seed}, {} holding limit per device, device keys RSA-{key_bits}\n",
+        euros(limit)
     );
 
     let cfg = Config {
-        keypair,
+        issuer_key,
+        key_bits,
         seed,
-        amount,
-        candidates,
-        opening_balance: balance,
-        trials,
+        limit,
+        devices,
+        ops,
     };
 
     let ok = match command {
         "check" => run_check(&cfg),
-        "soundness" => run_soundness(&cfg),
+        "fuzz" => run_fuzz(&cfg),
         "all" => {
             let checked = run_check(&cfg);
             println!();
-            let sound = run_soundness(&cfg);
-            checked && sound
+            let fuzzed = run_fuzz(&cfg);
+            checked && fuzzed
         }
         _ => unreachable!(),
     };

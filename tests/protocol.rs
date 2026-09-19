@@ -1,368 +1,355 @@
-//! Protocol-level tests: anonymity holds for one spend, identity falls out on
-//! two, cut-and-choose catches a forged identity, and honest cases settle.
+//! Protocol-level tests: partial payments, re-spending, holding limits,
+//! replay protection, certification, funding and defunding, and what a lost
+//! device or a cracked element does to the money supply.
 
 // Amounts are written as cents with the euros split off (`100_00` is 100.00 €),
 // the same convention the example and the harness binary use.
 #![allow(clippy::inconsistent_digit_grouping)]
 
-use digital_euro_wallet::blind_sig::IssuerKeypair;
-use digital_euro_wallet::error::Error;
-use digital_euro_wallet::field::Fp;
-use digital_euro_wallet::identity::LIMBS;
-use digital_euro_wallet::token::recover_identity;
 use digital_euro_wallet::{
-    withdraw, Issuer, Merchant, Settlement, SpendProof, Token, Wallet, WalletId,
+    defund, enrol, fund, pay, AccountId, DeviceCertificate, ElementState, Error, Issuer, Keypair,
+    Wallet,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng};
 
-const EXPIRY: u64 = 1_800_000_000;
-const NOW: u64 = 1_780_000_000;
-const AMOUNT: u64 = 10_00;
+const LIMIT: u64 = 500_00;
+/// 512-bit keys keep the suite quick; the harness and example use 2048.
+const KEY_BITS: u64 = 512;
+
+type Device = Wallet<StdRng>;
 
 struct World {
     issuer: Issuer,
-    alice: Wallet<StdRng>,
-    alice_id: WalletId,
-    bakery: Merchant<StdRng>,
-    kiosk: Merchant<StdRng>,
-    rng: StdRng,
+    alice_account: AccountId,
+    alice: Device,
+    bakery: Device,
+    supplier: Device,
 }
 
-/// 1024-bit modulus keeps the test suite quick; the demo uses 2048.
 fn world(seed: u64) -> World {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut issuer = Issuer::new(IssuerKeypair::generate(1024, &mut rng));
-    let public_key = issuer.public_key();
-    let alice_id = WalletId::from_bytes(rng.gen());
-    issuer.open_account(alice_id, 100_00);
-    World {
-        alice: Wallet::new(
-            alice_id,
-            public_key.clone(),
-            StdRng::seed_from_u64(seed + 1),
-        ),
-        alice_id,
-        bakery: Merchant::new(
-            *b"BAKERY01",
-            public_key.clone(),
-            StdRng::seed_from_u64(seed + 2),
-        ),
-        kiosk: Merchant::new(*b"KIOSK_02", public_key, StdRng::seed_from_u64(seed + 3)),
-        issuer,
-        rng,
-    }
-}
+    let mut issuer = Issuer::new(Keypair::generate(KEY_BITS, &mut rng));
+    let alice_account = AccountId([1; 16]);
+    let bakery_account = AccountId([2; 16]);
+    let supplier_account = AccountId([3; 16]);
+    issuer.open_account(alice_account, 100_00);
+    issuer.open_account(bakery_account, 0);
+    issuer.open_account(supplier_account, 0);
 
-fn spend(
-    wallet: &mut Wallet<StdRng>,
-    merchant: &mut Merchant<StdRng>,
-    serial: &[u8; 16],
-    timestamp: u64,
-) -> (Token, SpendProof) {
-    let request = merchant.request_payment(AMOUNT, timestamp).unwrap();
-    let (token, proof) = wallet.pay(serial, &request).unwrap();
-    merchant
-        .accept(&request, token.clone(), proof.clone(), timestamp)
-        .expect("merchant accepts");
-    (token, proof)
-}
-
-#[test]
-fn honest_payment_settles_and_stays_anonymous() {
-    let mut w = world(10);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
-
-    assert_eq!(w.issuer.balance_of(&w.alice_id), Some(100_00 - AMOUNT));
-    assert_eq!(w.alice.offline_balance(), AMOUNT);
-    assert_eq!(w.issuer.outstanding_cents(), AMOUNT);
-
-    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW);
-    for receipt in w.bakery.drain_deposits() {
-        assert_eq!(
-            w.issuer.redeem(&receipt),
-            Settlement::Credited {
-                amount_cents: AMOUNT
-            }
-        );
-    }
-    assert_eq!(w.issuer.outstanding_cents(), 0);
-    assert!(!w.issuer.is_suspended(&w.alice_id));
-}
-
-#[test]
-fn sealed_element_refuses_a_second_spend() {
-    let mut w = world(11);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
-    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW);
-
-    let request = w.kiosk.request_payment(AMOUNT, NOW + 60).unwrap();
-    assert_eq!(
-        w.alice.pay(&token.payload.serial, &request),
-        Err(Error::TokenAlreadySpent)
-    );
-}
-
-#[test]
-fn double_spend_reveals_the_payer() {
-    let mut w = world(12);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
-
-    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW);
-    w.alice.crack_secure_element();
-    spend(&mut w.alice, &mut w.kiosk, &token.payload.serial, NOW + 60);
-
-    let mut settlements = Vec::new();
-    for receipt in w.bakery.drain_deposits() {
-        settlements.push(w.issuer.redeem(&receipt));
-    }
-    for receipt in w.kiosk.drain_deposits() {
-        settlements.push(w.issuer.redeem(&receipt));
-    }
-
-    assert_eq!(
-        settlements[0],
-        Settlement::Credited {
-            amount_cents: AMOUNT
-        }
-    );
-    match &settlements[1] {
-        Settlement::DoubleSpend(report) => {
-            assert_eq!(report.culprit.as_ref().unwrap(), &w.alice_id);
-            assert!(report.account_known);
-            assert_eq!(report.first_merchant, *b"BAKERY01");
-            assert_eq!(report.second_merchant, *b"KIOSK_02");
-        }
-        other => panic!("expected a double-spend report, got {other:?}"),
-    }
-    assert!(w.issuer.is_suspended(&w.alice_id));
-}
-
-#[test]
-fn one_point_hides_the_identity_perfectly() {
-    // For any candidate slope there is an intercept fitting the observed
-    // point, so a single spend constrains the identity by exactly nothing.
-    let mut w = world(13);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 4, &mut w.rng).unwrap();
-    let (_, proof) = spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW);
-
-    let mut rng = StdRng::seed_from_u64(99);
-    for _ in 0..1000 {
-        let guess = Fp::random(&mut rng);
-        let implied_intercept = proof.response[0].sub(guess.mul(proof.challenge));
-        assert_eq!(
-            guess.mul(proof.challenge).add(implied_intercept),
-            proof.response[0]
-        );
-    }
-}
-
-#[test]
-fn duplicate_deposit_of_the_same_receipt_is_idempotent() {
-    let mut w = world(14);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
-    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW);
-
-    let receipts = w.bakery.drain_deposits();
-    assert_eq!(
-        w.issuer.redeem(&receipts[0]),
-        Settlement::Credited {
-            amount_cents: AMOUNT
-        }
-    );
-    assert_eq!(w.issuer.redeem(&receipts[0]), Settlement::DuplicateDeposit);
-    assert!(!w.issuer.is_suspended(&w.alice_id));
-}
-
-#[test]
-fn reused_challenge_does_not_unmask_anyone() {
-    // A colluding merchant that replays its own challenge gains two copies of
-    // the same point, which is still one point.
-    let mut w = world(15);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 8, &mut w.rng).unwrap();
-    let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, first) = w.alice.pay(&token.payload.serial, &request).unwrap();
-    w.alice.crack_secure_element();
-    let (_, second) = w.alice.pay(&token.payload.serial, &request).unwrap();
-
-    assert_eq!(first, second);
-    assert!(recover_identity(&first, &second).is_none());
-}
-
-#[test]
-fn cut_and_choose_rejects_a_forged_identity() {
-    let mut w = world(16);
-    let (mut request, session) = w.alice.begin_withdrawal(AMOUNT, EXPIRY, 6).unwrap();
-    let cut = w.issuer.cut(&request, &mut w.rng).unwrap();
-    let mut opening = w.alice.answer_cut(&session, &cut).unwrap();
-
-    // Tamper with one opened candidate: swap in a slope that is not Alice's.
-    let victim = opening
-        .openings
-        .iter_mut()
-        .find(|(index, _)| *index != cut.keep)
-        .unwrap();
-    victim.1.lines.coefficients[0].0 = Fp::new(1234);
-    victim.1.payload.commitment = victim.1.lines.commitment();
-    request.candidates[victim.0].commitment = victim.1.payload.commitment;
-    request.candidates[victim.0] = digital_euro_wallet::wallet::Candidate {
-        commitment: victim.1.payload.commitment,
-        blinded_message: w
-            .issuer
-            .public_key()
-            .blind(&victim.1.payload.digest(), &victim.1.blinding_factor),
+    let device = |account, n: u64, issuer: &mut Issuer, rng: &mut StdRng| {
+        enrol(
+            issuer,
+            account,
+            LIMIT,
+            KEY_BITS,
+            StdRng::seed_from_u64(seed * 10 + n),
+            rng,
+        )
+        .unwrap()
     };
-
-    match w.issuer.issue(&request, &cut, &opening) {
-        Err(Error::IdentityNotEmbedded { .. }) => {}
-        other => panic!("expected the forged identity to be caught, got {other:?}"),
+    let alice = device(alice_account, 1, &mut issuer, &mut rng);
+    let bakery = device(bakery_account, 2, &mut issuer, &mut rng);
+    let supplier = device(supplier_account, 3, &mut issuer, &mut rng);
+    World {
+        issuer,
+        alice_account,
+        alice,
+        bakery,
+        supplier,
     }
 }
 
-#[test]
-fn cut_and_choose_rejects_a_broken_commitment() {
-    let mut w = world(17);
-    let (request, session) = w.alice.begin_withdrawal(AMOUNT, EXPIRY, 6).unwrap();
-    let cut = w.issuer.cut(&request, &mut w.rng).unwrap();
-    let mut opening = w.alice.answer_cut(&session, &cut).unwrap();
-    opening.openings[0].1.lines.nonce[0] ^= 0xff;
+// ─────────────────────── spending part of a balance ───────────────────────
 
-    match w.issuer.issue(&request, &cut, &opening) {
-        Err(Error::CommitmentMismatch { .. }) => {}
-        other => panic!("expected a commitment mismatch, got {other:?}"),
-    }
+#[test]
+fn funding_moves_value_from_the_account_to_the_device() {
+    let mut w = world(1);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    assert_eq!(w.alice.balance(), 10_00);
+    assert_eq!(w.issuer.balance_of(&w.alice_account), Some(90_00));
+    assert_eq!(w.issuer.offline_float(), 10_00);
 }
 
 #[test]
-fn merchant_rejects_a_tampered_token() {
-    let mut w = world(18);
-    let mut token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
-    let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let (_, proof) = w.alice.pay(&token.payload.serial, &request).unwrap();
+fn paying_part_of_the_balance_leaves_the_rest_spendable() {
+    let mut w = world(2);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
 
-    token.payload.amount_cents = 50_00; // inflate the face value
+    pay(&mut w.alice, &mut w.bakery, 6_00).unwrap();
+    assert_eq!(w.alice.balance(), 4_00);
+    assert_eq!(w.bakery.balance(), 6_00);
+
+    // The 4 € left over is ordinary balance, spendable later.
+    pay(&mut w.alice, &mut w.supplier, 4_00).unwrap();
+    assert_eq!(w.alice.balance(), 0);
+    assert_eq!(w.supplier.balance(), 4_00);
+}
+
+#[test]
+fn received_value_is_immediately_respendable_offline() {
+    let mut w = world(3);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    pay(&mut w.alice, &mut w.bakery, 6_00).unwrap();
+
+    // The bakery never went online: it pays its supplier out of Alice's money.
+    pay(&mut w.bakery, &mut w.supplier, 5_00).unwrap();
+    assert_eq!(w.bakery.balance(), 1_00);
+    assert_eq!(w.supplier.balance(), 5_00);
+}
+
+#[test]
+fn payments_leave_the_issuer_none_the_wiser() {
+    let mut w = world(4);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let float = w.issuer.offline_float();
+    pay(&mut w.alice, &mut w.bakery, 6_00).unwrap();
+    pay(&mut w.bakery, &mut w.supplier, 5_00).unwrap();
+    assert_eq!(w.issuer.offline_float(), float);
     assert_eq!(
-        w.bakery.accept(&request, token, proof, NOW),
-        Err(Error::InvalidTokenSignature)
+        w.alice.balance() + w.bakery.balance() + w.supplier.balance(),
+        10_00
     );
 }
 
-#[test]
-fn merchant_rejects_an_answer_to_a_different_challenge() {
-    let mut w = world(19);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
-    let bakery_request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    let kiosk_request = w.kiosk.request_payment(AMOUNT, NOW).unwrap();
-    let (token, proof) = w.alice.pay(&token.payload.serial, &kiosk_request).unwrap();
+// ─────────────────────── refusals cost nothing ───────────────────────
 
+#[test]
+fn insufficient_funds_are_refused_before_any_debit() {
+    let mut w = world(5);
+    fund(&mut w.alice, &mut w.issuer, 5_00).unwrap();
     assert_eq!(
-        w.bakery.accept(&bakery_request, token, proof, NOW),
-        Err(Error::ChallengeMismatch)
-    );
-}
-
-#[test]
-fn expired_token_is_refused_by_the_element() {
-    let mut w = world(20);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, NOW - 1, 6, &mut w.rng).unwrap();
-    let request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-
-    assert!(matches!(
-        w.alice.pay(&token.payload.serial, &request),
-        Err(Error::Expired { .. })
-    ));
-    assert_eq!(
-        w.alice.offline_balance(),
-        AMOUNT,
-        "refusal must not burn the token"
-    );
-}
-
-#[test]
-fn expired_token_is_refused_by_the_terminal() {
-    // The element and the terminal can disagree about the time. The terminal
-    // enforces expiry against its own clock, whatever the request said.
-    let mut w = world(23);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, NOW - 1, 6, &mut w.rng).unwrap();
-    let request = w.bakery.request_payment(AMOUNT, NOW - 2).unwrap();
-    let (token, proof) = w.alice.pay(&token.payload.serial, &request).unwrap();
-
-    assert!(matches!(
-        w.bakery.accept(&request, token, proof, NOW),
-        Err(Error::Expired { .. })
-    ));
-}
-
-#[test]
-fn wrong_amount_is_refused_without_burning_the_token() {
-    let mut w = world(24);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
-
-    let short = w.bakery.request_payment(6_00, NOW).unwrap();
-    assert_eq!(
-        w.alice.pay(&token.payload.serial, &short),
-        Err(Error::AmountMismatch {
-            expected: 6_00,
-            found: AMOUNT
+        pay(&mut w.alice, &mut w.bakery, 6_00),
+        Err(Error::InsufficientFunds {
+            requested: 6_00,
+            available: 5_00
         })
     );
-    assert_eq!(w.alice.offline_balance(), AMOUNT);
-
-    // The token is untouched, so an exact payment still goes through.
-    spend(&mut w.alice, &mut w.bakery, &token.payload.serial, NOW + 1);
-    assert_eq!(w.alice.offline_balance(), 0);
+    assert_eq!(w.alice.balance(), 5_00);
+    // The payee's reservation was released too.
+    assert_eq!(w.bakery.reserved(), 0);
+    assert_eq!(w.bakery.headroom(), LIMIT);
 }
 
 #[test]
-fn element_refuses_a_request_whose_challenge_does_not_match_its_data() {
-    // A terminal that tampers with `x` (to replay an old one, say) is caught
-    // before the element answers, because the element derives `x` itself.
-    let mut w = world(25);
-    let token = withdraw(&mut w.alice, &mut w.issuer, AMOUNT, EXPIRY, 6, &mut w.rng).unwrap();
-    let mut request = w.bakery.request_payment(AMOUNT, NOW).unwrap();
-    request.challenge = Fp::new(42);
+fn payee_over_its_holding_limit_refuses_before_the_payer_is_debited() {
+    let mut w = world(6);
+    fund(&mut w.alice, &mut w.issuer, 100_00).unwrap();
+    // Fill the bakery to within 50 € of its limit.
+    w.issuer.open_account(AccountId([2; 16]), LIMIT);
+    fund(&mut w.bakery, &mut w.issuer, LIMIT - 50_00).unwrap();
 
     assert_eq!(
-        w.alice.pay(&token.payload.serial, &request),
-        Err(Error::ChallengeMismatch)
+        w.bakery.request_payment(60_00),
+        Err(Error::HoldingLimitExceeded {
+            requested: 60_00,
+            headroom: 50_00
+        })
     );
-    assert_eq!(w.alice.offline_balance(), AMOUNT);
+    assert_eq!(w.alice.balance(), 100_00, "the payer was never asked");
 }
 
 #[test]
-fn garbage_responses_recover_no_valid_identity() {
-    // A wallet that answers with noise breaks the linear relation, so the
-    // solver returns slopes that are not a well-formed identity.
-    let mut rng = StdRng::seed_from_u64(21);
-    let first = SpendProof {
-        challenge: Fp::new(11),
-        response: [(); LIMBS].map(|_| Fp::random(&mut rng)),
-    };
-    let second = SpendProof {
-        challenge: Fp::new(17),
-        response: [(); LIMBS].map(|_| Fp::random(&mut rng)),
-    };
-    let recovered = recover_identity(&first, &second).unwrap();
-    assert!(
-        recovered.is_err(),
-        "random points must not decode to an identity"
-    );
-}
-
-#[test]
-fn withdrawal_needs_funds_and_a_known_account() {
-    let mut w = world(22);
-    let (request, _) = w.alice.begin_withdrawal(500_00, EXPIRY, 4).unwrap();
+fn open_requests_reserve_room_so_they_cannot_jointly_overflow() {
+    let mut w = world(7);
+    let first = w.bakery.request_payment(300_00).unwrap();
+    assert_eq!(w.bakery.headroom(), LIMIT - 300_00);
     assert!(matches!(
-        w.issuer.cut(&request, &mut w.rng),
+        w.bakery.request_payment(300_00),
+        Err(Error::HoldingLimitExceeded { .. })
+    ));
+    assert!(w.bakery.cancel_request(&first.nonce));
+    assert_eq!(w.bakery.headroom(), LIMIT);
+}
+
+#[test]
+fn funding_over_the_holding_limit_is_refused_and_the_account_untouched() {
+    let mut w = world(8);
+    w.issuer.open_account(w.alice_account, 1_000_00);
+    assert!(matches!(
+        fund(&mut w.alice, &mut w.issuer, LIMIT + 1),
+        Err(Error::HoldingLimitExceeded { .. })
+    ));
+    assert_eq!(w.issuer.balance_of(&w.alice_account), Some(1_000_00));
+    assert_eq!(w.issuer.offline_float(), 0);
+}
+
+#[test]
+fn funding_beyond_the_account_balance_is_refused_and_the_reservation_released() {
+    let mut w = world(9);
+    assert!(matches!(
+        fund(&mut w.alice, &mut w.issuer, 200_00),
         Err(Error::InsufficientFunds { .. })
     ));
+    assert_eq!(w.alice.balance(), 0);
+    assert_eq!(w.alice.reserved(), 0);
+}
 
-    let stranger_key = w.issuer.public_key();
-    let stranger_id = WalletId::from_bytes([9u8; 32]);
-    let mut stranger = Wallet::new(stranger_id, stranger_key, StdRng::seed_from_u64(77));
-    let (request, _) = stranger.begin_withdrawal(AMOUNT, EXPIRY, 4).unwrap();
+// ─────────────────────── replay and tampering ───────────────────────
+
+#[test]
+fn a_replayed_transfer_is_credited_once() {
+    let mut w = world(10);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let request = w.bakery.request_payment(6_00).unwrap();
+    let transfer = w.alice.pay(&request).unwrap();
+
+    assert_eq!(w.bakery.receive(&transfer), Ok(6_00));
+    // Resending the same signed transfer — after a dropped connection, say —
+    // is harmless.
+    assert_eq!(w.bakery.receive(&transfer), Err(Error::AlreadyCredited));
+    assert_eq!(w.bakery.balance(), 6_00);
+}
+
+#[test]
+fn a_transfer_cannot_be_redirected_to_another_device() {
+    let mut w = world(11);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let request = w.bakery.request_payment(6_00).unwrap();
+    let mut transfer = w.alice.pay(&request).unwrap();
+
+    assert_eq!(w.supplier.receive(&transfer), Err(Error::NotForThisDevice));
+    transfer.payee = w.supplier.device();
+    assert_eq!(w.supplier.receive(&transfer), Err(Error::InvalidSignature));
+}
+
+#[test]
+fn an_inflated_transfer_breaks_the_payer_signature() {
+    let mut w = world(12);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let request = w.bakery.request_payment(6_00).unwrap();
+    let mut transfer = w.alice.pay(&request).unwrap();
+    transfer.amount_cents = 60_00;
+    assert_eq!(w.bakery.receive(&transfer), Err(Error::InvalidSignature));
+}
+
+#[test]
+fn a_transfer_answering_no_open_request_is_refused() {
+    let mut w = world(13);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let request = w.bakery.request_payment(6_00).unwrap();
+    w.bakery.cancel_request(&request.nonce);
+    let transfer = w.alice.pay(&request).unwrap();
+    assert_eq!(w.bakery.receive(&transfer), Err(Error::UnknownRequest));
+
+    // The payer's debit is not undone: once a device has paid, nothing offline
+    // can reverse it. This is the abandoned-transaction gap a real protocol
+    // has to close; the model leaves it open and says so.
+    assert_eq!(w.alice.balance(), 4_00);
+    assert_eq!(w.bakery.balance(), 0);
+}
+
+// ─────────────────────── certification ───────────────────────
+
+fn rogue_certificate(seed: u64) -> (DeviceCertificate, Keypair) {
+    // A key "certified" by someone other than the Eurosystem.
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rogue = Issuer::new(Keypair::generate(KEY_BITS, &mut rng));
+    let account = AccountId([9; 16]);
+    rogue.open_account(account, 0);
+    let keypair = Keypair::generate(KEY_BITS, &mut rng);
+    let certificate = rogue
+        .certify_device(account, &keypair.public, LIMIT, &mut rng)
+        .unwrap();
+    (certificate, keypair)
+}
+
+#[test]
+fn a_device_without_a_eurosystem_certificate_cannot_be_installed() {
+    let w = world(14);
+    let (certificate, keypair) = rogue_certificate(99);
     assert!(matches!(
-        w.issuer.cut(&request, &mut w.rng),
-        Err(Error::UnknownAccount(_))
+        Wallet::new(
+            certificate,
+            keypair,
+            w.issuer.public_key(),
+            StdRng::seed_from_u64(0)
+        ),
+        Err(Error::InvalidCertificate)
     ));
+}
+
+#[test]
+fn the_payer_refuses_to_pay_an_uncertified_device() {
+    let mut w = world(15);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let mut request = w.bakery.request_payment(6_00).unwrap();
+    request.payee = rogue_certificate(98).0;
+    assert_eq!(w.alice.pay(&request), Err(Error::InvalidCertificate));
+    assert_eq!(w.alice.balance(), 10_00);
+}
+
+#[test]
+fn a_device_cannot_pay_itself() {
+    let mut w = world(16);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let request = w.alice.request_payment(6_00).unwrap();
+    assert_eq!(w.alice.pay(&request), Err(Error::SelfPayment));
+    assert_eq!(w.alice.balance(), 10_00);
+}
+
+#[test]
+fn only_the_issuer_can_map_a_device_to_its_account() {
+    // The certificate the payee sees carries a device pseudonym and no
+    // account; the mapping lives with the issuer, which never sees payments.
+    let w = world(17);
+    assert_eq!(
+        w.issuer.account_of(&w.alice.device()),
+        Some(w.alice_account)
+    );
+}
+
+// ─────────────────────── defunding ───────────────────────
+
+#[test]
+fn defunding_returns_value_to_the_account() {
+    let mut w = world(18);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    pay(&mut w.alice, &mut w.bakery, 6_00).unwrap();
+    defund(&mut w.alice, &mut w.issuer, 4_00).unwrap();
+    assert_eq!(w.alice.balance(), 0);
+    assert_eq!(w.issuer.balance_of(&w.alice_account), Some(94_00));
+    assert_eq!(w.issuer.offline_float(), 6_00);
+}
+
+#[test]
+fn a_defunding_order_cannot_be_cashed_twice() {
+    let mut w = world(19);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    let order = w.alice.defund(4_00).unwrap();
+    assert_eq!(w.issuer.defund(&order), Ok(4_00));
+    assert_eq!(w.issuer.defund(&order), Err(Error::Replay));
+    assert_eq!(w.issuer.balance_of(&w.alice_account), Some(94_00));
+}
+
+// ─────────────────────── loss and compromise ───────────────────────
+
+#[test]
+fn a_lost_device_takes_its_balance_with_it() {
+    let mut w = world(20);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    drop(w.alice);
+    // The account stays debited and the value stays "on devices" for good.
+    assert_eq!(w.issuer.balance_of(&w.alice_account), Some(90_00));
+    assert_eq!(w.issuer.offline_float(), 10_00);
+}
+
+#[test]
+fn a_cracked_element_creates_money_that_shows_up_only_in_aggregate() {
+    let mut w = world(21);
+    fund(&mut w.alice, &mut w.issuer, 10_00).unwrap();
+    w.alice.crack_secure_element();
+    assert_eq!(w.alice.state(), ElementState::Cracked);
+
+    // The same 10 € paid out twice. Both payees accept: the transfers carry a
+    // genuine certificate and a genuine signature.
+    pay(&mut w.alice, &mut w.bakery, 10_00).unwrap();
+    pay(&mut w.alice, &mut w.supplier, 10_00).unwrap();
+    assert_eq!(w.bakery.balance() + w.supplier.balance(), 20_00);
+
+    // Offline, nothing notices. Online, the float only goes negative once
+    // more value leaves the circuit than ever entered it.
+    defund(&mut w.bakery, &mut w.issuer, 10_00).unwrap();
+    assert_eq!(w.issuer.offline_float(), 0);
+    defund(&mut w.supplier, &mut w.issuer, 10_00).unwrap();
+    assert_eq!(w.issuer.offline_float(), -10_00);
 }

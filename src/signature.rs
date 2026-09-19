@@ -1,16 +1,14 @@
-//! Chaum RSA blind signatures, used by the issuer to certify offline tokens
-//! without learning which token it certified.
+//! RSA signatures with a full-domain hash, used for device certificates, value
+//! transfers, and funding messages.
 //!
-//! Wallet computes `m' = FDH(m) * r^e mod n`, the bank returns
-//! `s' = (m')^d mod n`, and the wallet unblinds with `s = s' * r^-1 mod n`,
-//! which is a plain signature `s = FDH(m)^d` on a message the bank never saw.
+//! `sign(m) = FDH(m)^d mod n`, `verify(m, s) <=> s^e == FDH(m) mod n`.
 //!
 //! # Scope
 //!
 //! This is a readable reference implementation: schoolbook modexp, a
-//! hash-expansion full-domain hash, and no side-channel hardening. A
-//! production wallet would delegate the private key to an HSM and use a
-//! reviewed scheme (RSA-FDH per RFC 9474, or a blind Schnorr / BBS variant).
+//! hash-expansion full-domain hash, and no side-channel hardening. A real
+//! secure element would use an elliptic-curve scheme in hardware, with the
+//! private key generated on-chip and never exported.
 
 use crate::hash::tagged;
 use num_bigint::{BigInt, BigUint, RandBigInt, Sign};
@@ -18,14 +16,14 @@ use num_integer::Integer;
 use num_traits::{One, Zero};
 use rand::Rng;
 
-/// Public verification key of the issuer (the Eurosystem backend).
+/// A verification key: the Eurosystem's, or a certified device's.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IssuerPublicKey {
+pub struct PublicKey {
     pub n: BigUint,
     pub e: BigUint,
 }
 
-impl IssuerPublicKey {
+impl PublicKey {
     /// Size of the modulus in bytes.
     pub fn modulus_bytes(&self) -> usize {
         (self.n.bits() as usize).div_ceil(8)
@@ -47,46 +45,24 @@ impl IssuerPublicKey {
         BigUint::from_bytes_be(&expanded).mod_floor(&self.n)
     }
 
-    /// Verifies an unblinded signature: `s^e == FDH(m) mod n`.
+    /// `s^e == FDH(m) mod n`.
     pub fn verify(&self, digest: &[u8; 32], signature: &BigUint) -> bool {
         if signature >= &self.n {
             return false;
         }
         signature.modpow(&self.e, &self.n) == self.full_domain_hash(digest)
     }
-
-    /// Samples a blinding factor `r` invertible mod `n`.
-    pub fn blinding_factor<R: Rng + ?Sized>(&self, rng: &mut R) -> BigUint {
-        loop {
-            let r = rng.gen_biguint_below(&self.n);
-            if !r.is_zero() && r.gcd(&self.n).is_one() {
-                return r;
-            }
-        }
-    }
-
-    /// `FDH(m) * r^e mod n` — what the wallet sends to the issuer.
-    pub fn blind(&self, digest: &[u8; 32], r: &BigUint) -> BigUint {
-        let masked = r.modpow(&self.e, &self.n);
-        (self.full_domain_hash(digest) * masked).mod_floor(&self.n)
-    }
-
-    /// `s' * r^-1 mod n` — turns the issuer's answer into a usable signature.
-    pub fn unblind(&self, blinded_signature: &BigUint, r: &BigUint) -> BigUint {
-        let inverse =
-            mod_inverse(r, &self.n).expect("blinding factor is invertible by construction");
-        (blinded_signature * inverse).mod_floor(&self.n)
-    }
 }
 
-/// Issuer signing key. Never leaves the backend.
+/// A signing key. The Eurosystem's stays in its backend; a device's never
+/// leaves the secure element.
 #[derive(Clone, Debug)]
-pub struct IssuerKeypair {
-    pub public: IssuerPublicKey,
+pub struct Keypair {
+    pub public: PublicKey,
     d: BigUint,
 }
 
-impl IssuerKeypair {
+impl Keypair {
     /// Generates a fresh RSA keypair with public exponent 65537.
     ///
     /// `bits` is the modulus size; use >= 2048 for anything but tests.
@@ -111,20 +87,13 @@ impl IssuerKeypair {
                 continue;
             }
             let d = mod_inverse(&e, &phi).expect("e is coprime to phi");
-            return IssuerKeypair {
-                public: IssuerPublicKey { n, e },
+            return Keypair {
+                public: PublicKey { n, e },
                 d,
             };
         }
     }
 
-    /// Raw signing operation on an already-blinded message. The issuer sees a
-    /// uniformly random residue and learns nothing about the token inside.
-    pub fn sign_blinded(&self, blinded: &BigUint) -> BigUint {
-        blinded.modpow(&self.d, &self.public.n)
-    }
-
-    /// Non-blinded signing, used for issuer-side test vectors.
     pub fn sign(&self, digest: &[u8; 32]) -> BigUint {
         self.public
             .full_domain_hash(digest)
@@ -133,7 +102,7 @@ impl IssuerKeypair {
 }
 
 /// Extended-Euclid modular inverse.
-pub fn mod_inverse(a: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+fn mod_inverse(a: &BigUint, modulus: &BigUint) -> Option<BigUint> {
     let a = BigInt::from_biguint(Sign::Plus, a.clone());
     let m = BigInt::from_biguint(Sign::Plus, modulus.clone());
     let gcd = a.extended_gcd(&m);
@@ -208,34 +177,31 @@ mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
 
-    fn keypair() -> (IssuerKeypair, StdRng) {
-        let mut rng = StdRng::seed_from_u64(42);
-        let keypair = IssuerKeypair::generate(512, &mut rng);
-        (keypair, rng)
+    fn keypair() -> Keypair {
+        Keypair::generate(512, &mut StdRng::seed_from_u64(42))
     }
 
     #[test]
-    fn blind_signature_matches_direct_signature() {
-        let (bank, mut rng) = keypair();
-        let digest = tagged("test", &[b"token"]);
-        let r = bank.public.blinding_factor(&mut rng);
-        let blinded = bank.public.blind(&digest, &r);
-        let blinded_signature = bank.sign_blinded(&blinded);
-        let signature = bank.public.unblind(&blinded_signature, &r);
-        assert!(bank.public.verify(&digest, &signature));
-        assert_eq!(signature, bank.sign(&digest));
+    fn signature_verifies() {
+        let key = keypair();
+        let digest = tagged("test", &[b"transfer"]);
+        assert!(key.public.verify(&digest, &key.sign(&digest)));
     }
 
     #[test]
     fn signature_does_not_verify_for_other_message() {
-        let (bank, mut rng) = keypair();
-        let digest = tagged("test", &[b"token-a"]);
-        let other = tagged("test", &[b"token-b"]);
-        let r = bank.public.blinding_factor(&mut rng);
-        let signature = bank
-            .public
-            .unblind(&bank.sign_blinded(&bank.public.blind(&digest, &r)), &r);
-        assert!(!bank.public.verify(&other, &signature));
+        let key = keypair();
+        let digest = tagged("test", &[b"transfer-a"]);
+        let other = tagged("test", &[b"transfer-b"]);
+        assert!(!key.public.verify(&other, &key.sign(&digest)));
+    }
+
+    #[test]
+    fn signature_does_not_verify_under_other_key() {
+        let key = keypair();
+        let other = Keypair::generate(512, &mut StdRng::seed_from_u64(43));
+        let digest = tagged("test", &[b"transfer"]);
+        assert!(!other.public.verify(&digest, &key.sign(&digest)));
     }
 
     #[test]

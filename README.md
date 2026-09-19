@@ -1,165 +1,171 @@
 # digital-euro-wallet
 
-A Rust model of the offline digital euro wallet: cash-like anonymity for ordinary
-payments, with the payer's device identity falling out of the algebra the moment a
-token is spent twice.
-
-The scheme is Chaum–Fiat–Naor style e-cash — a 2-of-2 secret sharing line per
-identity limb, blind RSA issuance, and cut-and-choose to stop a wallet from
-embedding a fake identity.
+A Rust model of the offline digital euro as the ECB has described it: value held
+as a balance on a secure element, paid directly from one certified device to
+another, settled locally, and immediately re-spendable offline.
 
 ```
-   online funding                 offline payment              settlement
-   ──────────────                 ───────────────              ──────────
-   wallet ──n candidates──► issuer
-   wallet ◄───── cut ────── issuer    merchant ────x────► wallet
-   wallet ──n-1 openings──► issuer    merchant ◄──(x,y)─── wallet
-   wallet ◄blind signature─ issuer    merchant ──receipt──► issuer
+   online                            offline, device to device
+   ──────                            ─────────────────────────
+   account ──funding───► device A    device B ──PaymentRequest──► device A
+   account ◄─defunding── device A    device B ◄──────Transfer──── device A
 ```
+
+Pay 6 € out of 10 € and the payer's element keeps 4 €. There is nothing to split
+and no change to hand back, because there are no tokens, only a balance. The payee
+can spend its 6 € straight away, still offline.
 
 ## Run it
 
 ```bash
-cargo test                                      # 21 unit + protocol tests
-cargo run --release --example offline_payment   # narrated end-to-end run
+cargo test                                      # 25 unit and protocol tests
+cargo run --release --example offline_payment   # narrated run
 cargo build --release                           # builds the harness executable
 ```
 
-The example funds a 10 € token, spends it at a bakery, shows the sealed secure
-element refusing a second spend, then cracks the element, double-spends at a
-kiosk, and watches the backend recover the wallet identity at settlement.
+The example funds Alice's phone with 10 € and buys 6 € of bread. The bakery then
+pays the flour mill 5 € out of that money, never going online. Alice's overdraft
+is refused and she spends her remaining 4 €. After that the example shows what a
+lost phone and a cracked secure element do to the money supply.
 
 ### The harness executable
 
-`cargo build --release` produces `target/release/digital-euro-wallet`
-(`.exe` on Windows), an acceptance harness that drives whole protocol runs and
-asserts the outcome of each. It exits non-zero if anything fails.
+`target/release/digital-euro-wallet` (`.exe` on Windows) drives whole runs
+across several devices and exits non-zero if anything fails.
 
 ```bash
-digital-euro-wallet check        # 11 end-to-end scenarios, PASS/FAIL (default)
-digital-euro-wallet soundness    # measure the forgery escape rate against 1/n
-digital-euro-wallet all          # both
-digital-euro-wallet --help       # --seed, --key-bits, --candidates, --amount, …
+digital-euro-wallet check    # 8 end-to-end scenarios, PASS/FAIL (default)
+digital-euro-wallet fuzz     # random operations, invariants after every one
+digital-euro-wallet all      # both
+digital-euro-wallet --help   # --seed, --key-bits, --limit, --devices, --ops
 ```
 
-`check` covers what `cargo test` does not reach as a whole-system property:
-value conservation across issuance and settlement (no cent created or
-destroyed over four tokens and two terminals), and the claim that a single
-point excludes no slope, sampled 2000 times per limb.
+`fuzz` runs random fundings, payments and defundings across many devices,
+with amounts large enough to hit every kind of refusal. After *every*
+operation it checks that:
 
-`soundness` puts a number on the cut-and-choose bound. A cheating wallet forges
-one of `n` candidates and is signed only if the issuer happens to keep that one,
-so the escape rate should sit at `1/n`; the harness runs the attack repeatedly
-and checks the observed rate against a four-sigma binomial band, while asserting
-that *every* forgery the issuer opened was caught. At the default `n = 20`:
+- no device exceeds its holding limit and no reservation is left dangling;
+- the value on devices equals the issuer's offline float;
+- online balances plus the float equal the money that existed at the start;
+- a refused operation changed nothing anywhere.
 
-```
-  caught 190, escaped 10
-  observed escape rate 0.0500, expected 1/n = 0.0500
-```
+## What comes from the ECB, and what is this model's own
 
-## How the pieces map to the maths
+**Described by the ECB and the offline project** (see sources below):
 
-| Concept | Where |
-| --- | --- |
-| `f(x) = I·x + s mod p` | `src/token.rs` — `SecretLines::respond` |
-| `I = (y₁−y₂)(x₁−x₂)⁻¹` | `src/token.rs` — `recover_identity` |
-| `F_p`, `p = 2^61 − 1` | `src/field.rs` |
-| 256-bit `I` split into 5 × 52-bit slopes | `src/identity.rs` |
-| Blind signature `m·rᵉ → sᵈ → s·r⁻¹` | `src/blind_sig.rs` |
-| Cut-and-choose verification | `src/issuer.rs` — `Issuer::issue` |
-| Challenge `x = H(merchant‖ts‖amount‖nonce)` | `src/token.rs` — `derive_challenge` |
-| Sealed vs. cracked secure element | `src/wallet.rs` — `ElementState` |
+- Offline value sits in an applet on a secure element that "debits and credits
+  a balance".
+- It moves directly between certified devices and settles locally between them.
+- It is "immediately re-spendable offline".
+- It is funded from, and defunded to, an online digital euro account.
+- Double-spending prevention rests on tamper-resistant hardware. Two devices
+  with no shared record cannot stop a double spend by cryptography alone.
+- Transaction details are visible only to the payer and payee. Nothing is
+  reported to banks or the central bank.
+- There is reportedly no recovery for funds on a lost, damaged or stolen device.
 
-### Why five lines instead of one
+**This model's own choices.** The ECB has not published a wire protocol:
 
-`p = 2^61 − 1` keeps every field operation inside a `u128`, so the hot path needs
-no bignum. A 256-bit identity does not fit in one such field element, so it is cut
-into five 52-bit limbs, each the slope of its own line. All five lines are
-evaluated at the *same* merchant challenge, so one double-spend yields two points
-per line and every limb is recovered together.
+- The messages (`PaymentRequest`, `Transfer`, `FundingRequest`, `Funding`,
+  `Defunding`), their signatures, and the nonce and counter replay protection.
+- **The payee reserves room under its holding limit before the payer is
+  debited.** A payment can fail on the payee's side, so the reservation is made
+  when the request is issued, not when the transfer arrives. Once the payer has
+  paid, the credit cannot fail. On the payer's side, every check that could
+  cause a refusal runs before the debit. A refused payment costs nobody
+  anything.
+- **The holding limit** is a per-device parameter (500 € by default), not an
+  ECB figure. The ECB's own calibration covers overall digital euro holdings,
+  and was still in progress in the sources consulted.
+- **Device certificates omit the account.** The payee sees a device pseudonym;
+  only the issuer can map it back to an account, and the issuer never sees
+  payments.
+- **The offline float** (funded minus defunded) is the issuer's only view of
+  offline money.
 
-### Why the intercept is fresh per token
+## What a cracked secure element does
 
-The intercept `s` is the only thing hiding the slope. Reusing an intercept across
-two tokens would let two single spends of *different* tokens be combined into two
-points on one line — an anonymity break with no double-spend at all. Each
-candidate draws fresh intercepts for every limb.
+The whole design rests on the element refusing to spend value it does not have.
+`crack_secure_element()` models that failing: the element keeps signing payments
+without debiting itself.
 
-### Why the merchant derives the challenge from the sale
+- **Offline, nobody can tell.** The payee sees a genuine certificate and a
+  genuine signature.
+- **Online, the issuer sees only the float.** Counterfeiting pushes the value
+  actually on devices above the float, and the issuer cannot see what is
+  actually on devices. It notices only if more is defunded than was ever
+  funded, which drives the float negative. That may never happen.
+- **Even then there is no culprit.** Payments are never reported, so nothing on
+  record links the extra money to the device that made it.
 
-If a merchant could pick `x` freely it could replay a previous `x`, and two points
-sharing an abscissa determine nothing. `derive_challenge` binds `x` to merchant
-id, timestamp, amount and nonce; `x = 0` is refused because `f(0) = s` leaks the
-intercept and nothing else. The `reused_challenge_does_not_unmask_anyone` test
-pins this down: replaying a challenge leaves the payer anonymous, which is the
-correct — and deliberate — outcome.
+In the example, a cracked phone funded with 10 € pays out 20 € and still shows
+10 €, so 20 € is created from nothing. After the payees defund, the issuer's
+float reads a healthy +10 €.
 
-## Settlement outcomes
+This is a real weakness of hardware-only designs, not an artefact of the model.
+The alternative this repository used to implement is Chaum–Fiat–Naor e-cash,
+whose double-spending *reveals the culprit's identity* algebraically. That
+approach costs divisibility and re-spendability, which is why it was dropped. It
+is kept at the git tag `cfn-model`.
 
-`Issuer::redeem` returns one of:
+## Lost devices
 
-- `Credited` — first sighting of the serial, merchant paid, payer anonymous.
-- `DuplicateDeposit` — same serial, same challenge, same answer: a merchant
-  depositing twice. Paid once, no fraud inferred.
-- `DoubleSpend(FraudReport)` — two distinct challenges on one serial. Contains
-  the recovered `WalletId`, both merchant ids, and whether the identity matches a
-  registered account.
-- `Rejected(Error)` — bad signature, or two answers on the same challenge that
-  differ, which is a forged response rather than a double-spend.
+Funding debits the online account, and nothing ever credits it back except
+defunding, which needs the device. Lose the device and the value goes with it.
+The float keeps counting it for good. This matches what has been reported about
+the digital euro: offline funds on a lost device are treated like lost cash.
 
 ## Security scope
 
 This is a reference model, written to be read. It is **not** production
 cryptography:
 
-- Schoolbook `modpow`, no constant-time discipline, no blinding against timing or
-  fault attacks on the issuer key.
-- A hash-expansion full-domain hash rather than a reviewed scheme (RSA-FDH per
-  RFC 9474, or a blind Schnorr / BBS construction).
-- No secure-element attestation, no transport security between devices, no key
-  storage story. A merchant offline cannot verify that the payer's answer lies on
-  the committed lines at all — it accepts on the strength of the issuer's
-  signature and the element's tamper resistance, exactly as a shopkeeper accepts a
-  banknote. Garbage answers are caught only at settlement, where they decode to
-  slopes outside the identity's bit budget.
-- Not modelled: denominations and change, offline holding limits, expiry-driven
-  re-anchoring, revocation lists, staged or partial anonymity revocation, and
-  every legal or data-protection requirement that would govern a real disclosure.
-
-Cut-and-choose over `n` candidates leaves a cheating wallet a `1/n` chance of
-getting a forged identity certified — measurable with
-`digital-euro-wallet soundness`. The example uses `n = 20`; tests use smaller
-values for speed. `1/20` is a deliberately generous bound for a reference model:
-a real deployment would either raise `n` or replace cut-and-choose with a
-zero-knowledge proof that the identity is embedded, which costs one proof instead
-of `n` blinded candidates per token.
+- RSA with a hash-expansion full-domain hash, schoolbook modexp, no
+  constant-time discipline. A real secure element would use an elliptic-curve
+  scheme in hardware, with the key generated on-chip and never exported.
+- The secure element is a Rust struct. Its "tamper resistance" is Rust's type
+  system, and `crack_secure_element()` is how the model turns it off.
+- Not modelled: device revocation, secure-element attestation, transport
+  security, the legal framework. Transaction recovery is modelled only as far as
+  resending a signed transfer, which is safe because each request nonce is
+  credited once. If the payee abandons a request after the payer has paid, the
+  payer's debit is not undone. The test
+  `a_transfer_answering_no_open_request_is_refused` pins that gap down.
 
 ## Layout
 
 ```
-src/field.rs      F_p arithmetic
-src/identity.rs   WalletId ↔ limb slopes
-src/hash.rs       domain-separated SHA-256
-src/blind_sig.rs  RSA blind signatures, prime generation, Miller-Rabin
-src/token.rs      payload, lines, proofs, double-spend solver
-src/wallet.rs     secure element, withdrawal, payment
-src/merchant.rs   challenge issuance, offline acceptance, deposits
-src/issuer.rs     accounts, cut-and-choose, ledger, settlement
-src/main.rs       acceptance harness executable (check / soundness)
+src/signature.rs    RSA-FDH signatures, prime generation, Miller-Rabin
+src/hash.rs         domain-separated SHA-256
+src/id.rs           AccountId, DeviceId
+src/certificate.rs  Eurosystem-signed device certificates
+src/message.rs      payment, transfer, funding, and defunding messages
+src/wallet.rs       the secure-element applet: balance, pay, receive, fund
+src/issuer.rs       accounts, device certification, funding, defunding, float
+src/lib.rs          enrol / fund / defund / pay helpers
+src/main.rs         harness executable (check / fuzz)
 
-examples/offline_payment.rs   narrated end-to-end run
+examples/offline_payment.rs   narrated run
 tests/protocol.rs             protocol-level tests
 ```
 
 Dependencies are pinned to versions that build on Rust 1.75 (`sha2`,
-`num-bigint`, `num-integer`, `num-traits`, `rand`), and that minimum is declared
-as `rust-version` in `Cargo.toml` so cargo enforces it and clippy stops
-suggesting standard-library APIs that only exist on newer toolchains.
+`num-bigint`, `num-integer`, `num-traits`, `rand`). That minimum is declared as
+`rust-version` in `Cargo.toml`, so cargo enforces it and clippy stops suggesting
+standard-library APIs that only exist on newer toolchains.
 
 `cargo clippy --all-targets -- -D warnings` is clean. Two lints are suppressed
-deliberately rather than fixed, each with the reason recorded at the site:
-`should_implement_trait` on `Fp`, because the reduction mod `p` should stay
-visible at the call site instead of hiding behind `+`, and
-`inconsistent_digit_grouping`, because amounts are written as cents with the
-euros split off (`100_00` is 100.00 €).
+on purpose, with the reason recorded where each applies. `inconsistent_digit_grouping`
+is off because amounts are written as cents with the euros split off (`100_00`
+is 100.00 €). `should_implement_trait` no longer applies, since the field
+arithmetic went with the CFN model.
+
+## Sources
+
+- [OMFIF — The offline digital euro: when the secure element fails, what remains?](https://www.omfif.org/2026/09/the-offline-digital-euro-when-the-secure-element-fails-what-remains/)
+  (quotes the ECB's description of the balance model and hardware-based
+  double-spend protection)
+- [Nexi — ECB awards G+D, Nexi and Capgemini the offline digital euro solution](https://www.nexigroup.com/en/media-relations/news/2025/10/ecb-digital-euro/)
+- [ECB — The offline digital euro, ERPB, 9 April 2026](https://www.ecb.europa.eu/euro/digital_euro/timeline/profuse/shared/pdf/ecb.dep260409_Item_1_ECB_Presentation_Offline_Digital_Euro.en.pdf)
+- [Wikipedia — Digital euro](https://en.wikipedia.org/wiki/Digital_euro) (no
+  loss recovery for offline funds; holding-limit calibration)

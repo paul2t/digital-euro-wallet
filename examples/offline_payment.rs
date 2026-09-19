@@ -1,118 +1,172 @@
-//! End-to-end walk through the offline digital euro protocol.
+//! End-to-end walk through the offline digital euro.
 //!
 //! Run with `cargo run --release --example offline_payment`.
 
-use digital_euro_wallet::blind_sig::IssuerKeypair;
-use digital_euro_wallet::{withdraw, ElementState, Issuer, Merchant, Settlement, Wallet, WalletId};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+// Amounts are written as cents with the euros split off (`10_00` is 10.00 €).
+#![allow(clippy::inconsistent_digit_grouping)]
 
-const CANDIDATES: usize = 20;
-const EXPIRY: u64 = 1_800_000_000;
-const NOW: u64 = 1_780_000_000;
+use digital_euro_wallet::{defund, enrol, fund, pay, AccountId, Issuer, Keypair, Wallet};
+use rand::{rngs::StdRng, SeedableRng};
+
+const KEY_BITS: u64 = 2048;
+/// A parameter of the model, not a figure published by the ECB.
+const HOLDING_LIMIT: u64 = 500_00;
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(2026);
 
-    println!("── setting up the Eurosystem backend (RSA-2048 blind signing key)");
-    let issuer_key = IssuerKeypair::generate(2048, &mut rng);
-    let mut issuer = Issuer::new(issuer_key);
-    let public_key = issuer.public_key();
+    println!("── the Eurosystem and three accounts");
+    let mut issuer = Issuer::new(Keypair::generate(KEY_BITS, &mut rng));
+    let alice_account = AccountId([0xa1; 16]);
+    let bakery_account = AccountId([0xb2; 16]);
+    let mill_account = AccountId([0xc3; 16]);
+    issuer.open_account(alice_account, 50_00);
+    issuer.open_account(bakery_account, 0);
+    issuer.open_account(mill_account, 0);
 
-    let alice_id = WalletId::from_bytes(rng.gen());
-    issuer.open_account(alice_id, 50_00);
-    let mut alice = Wallet::new(alice_id, public_key.clone(), StdRng::seed_from_u64(1));
-    println!("   Alice's wallet identity: {}…", alice_id.short());
+    let mut device = |account, seed, issuer: &mut Issuer| {
+        enrol(
+            issuer,
+            account,
+            HOLDING_LIMIT,
+            KEY_BITS,
+            StdRng::seed_from_u64(seed),
+            &mut rng,
+        )
+        .expect("enrolment")
+    };
+    let mut alice = device(alice_account, 1, &mut issuer);
+    let mut bakery = device(bakery_account, 2, &mut issuer);
+    let mut mill = device(mill_account, 3, &mut issuer);
+    println!("   Alice's phone: device {}", alice.device().short());
+    println!("   bakery till:   device {}", bakery.device().short());
+    println!("   flour mill:    device {}", mill.device().short());
+    println!("   holding limit: {} per device", euros(HOLDING_LIMIT));
+
+    println!("\n── funding: Alice moves 10 € from her account onto her phone (online)");
+    fund(&mut alice, &mut issuer, 10_00).expect("funding");
     println!(
-        "   online account balance:  {} cents",
-        issuer.balance_of(&alice_id).unwrap()
+        "   account {}, phone {}",
+        euros(account(&issuer, alice_account)),
+        euros(alice.balance())
     );
 
-    let mut bakery = Merchant::new(*b"BAKERY01", public_key.clone(), StdRng::seed_from_u64(2));
-    let mut kiosk = Merchant::new(*b"KIOSK_02", public_key.clone(), StdRng::seed_from_u64(3));
-
-    println!("\n── funding: one 10.00 € token, cut-and-choose over {CANDIDATES} candidates");
-    let token =
-        withdraw(&mut alice, &mut issuer, 10_00, EXPIRY, CANDIDATES, &mut rng).expect("withdrawal");
-    println!("   token serial:            {}", hex(&token.payload.serial));
-    println!("   issuer never saw it, yet certified the identity inside it");
+    println!("\n── offline: Alice buys bread for 6 €");
+    pay(&mut alice, &mut bakery, 6_00).expect("bread");
     println!(
-        "   online balance now:      {} cents",
-        issuer.balance_of(&alice_id).unwrap()
+        "   phone {}, bakery {}",
+        euros(alice.balance()),
+        euros(bakery.balance())
+    );
+    println!("   nothing split, nothing sent back: 4 € simply stay on the phone");
+
+    println!("\n── offline: the bakery pays the mill 5 € out of what it just received");
+    pay(&mut bakery, &mut mill, 5_00).expect("flour");
+    println!(
+        "   bakery {}, mill {}",
+        euros(bakery.balance()),
+        euros(mill.balance())
     );
     println!(
-        "   offline balance:         {} cents",
-        alice.offline_balance()
+        "   the issuer has seen none of this; its float is still {}",
+        float(&issuer)
     );
 
-    println!("\n── offline payment at the bakery (both devices air-gapped)");
-    let request = bakery.request_payment(10_00, NOW).unwrap();
-    println!("   challenge x1 = {}", request.challenge);
-    let (paid_token, proof) = alice.pay(&token.payload.serial, &request).unwrap();
-    let first_point = proof.response[0];
-    bakery
-        .accept(&request, paid_token, proof, NOW)
-        .expect("bakery accepts");
-    println!("   response  y1 = {first_point} (first limb) — reveals nothing about I");
-
-    println!("\n── the secure element is sealed: a second spend is refused");
-    let retry = kiosk.request_payment(10_00, NOW + 60).unwrap();
-    match alice.pay(&token.payload.serial, &retry) {
-        Err(error) => println!("   {error}"),
-        Ok(_) => unreachable!("a sealed element must refuse"),
+    println!("\n── offline: Alice tries to spend 6 € again, with 4 € left");
+    match pay(&mut alice, &mut bakery, 6_00) {
+        Err(error) => println!("   refused: {error}"),
+        Ok(_) => unreachable!("an intact element never overdraws"),
     }
+    println!("   phone still {}, nothing lost", euros(alice.balance()));
 
-    println!("\n── attacker rolls back the element's anti-replay state");
-    alice.crack_secure_element();
-    assert_eq!(alice.state(), ElementState::Cracked);
-    let (cloned_token, second_proof) = alice.pay(&token.payload.serial, &retry).unwrap();
-    println!("   challenge x2 = {}", retry.challenge);
+    println!("\n── offline: she spends the 4 € at the mill instead");
+    pay(&mut alice, &mut mill, 4_00).expect("spend the rest");
     println!(
-        "   response  y2 = {} (first limb)",
-        second_proof.response[0]
+        "   phone {}, mill {}",
+        euros(alice.balance()),
+        euros(mill.balance())
     );
-    kiosk
-        .accept(&retry, cloned_token, second_proof, NOW + 60)
-        .expect("kiosk accepts — it cannot tell, offline");
 
-    println!("\n── merchants come back online and deposit");
-    for receipt in bakery.drain_deposits() {
-        report(issuer.redeem(&receipt), "bakery");
-    }
-    for receipt in kiosk.drain_deposits() {
-        report(issuer.redeem(&receipt), "kiosk");
-    }
+    println!("\n── defunding: the mill moves its takings back online");
+    defund(&mut mill, &mut issuer, 9_00).expect("defunding");
+    println!(
+        "   mill's account {}, float {}",
+        euros(account(&issuer, mill_account)),
+        float(&issuer)
+    );
 
-    println!("\n── aftermath");
+    println!("\n── a lost phone");
+    fund(&mut alice, &mut issuer, 20_00).expect("funding");
+    drop(alice);
+    println!("   20 € funded, then the phone is lost. There is no recovery:");
     println!(
-        "   account suspended:       {}",
-        issuer.is_suspended(&alice_id)
+        "   Alice's account stays at {}; the 20 € stay counted in the float, now {}",
+        euros(account(&issuer, alice_account)),
+        float(&issuer)
+    );
+
+    println!("\n── a cracked secure element");
+    let mut mallory = new_mallory(&mut issuer);
+    fund(&mut mallory, &mut issuer, 10_00).expect("funding");
+    mallory.crack_secure_element();
+    pay(&mut mallory, &mut bakery, 10_00).expect("first spend");
+    pay(&mut mallory, &mut mill, 10_00).expect("second spend of the same 10 €");
+    println!("   10 € funded, paid out twice; both payees accepted genuine signatures");
+    println!(
+        "   Mallory's phone still shows {}",
+        euros(mallory.balance())
+    );
+    let bakery_takings = bakery.balance();
+    defund(&mut bakery, &mut issuer, bakery_takings).expect("defunding");
+    let mill_takings = mill.balance();
+    defund(&mut mill, &mut issuer, mill_takings).expect("defunding");
+
+    // Value the issuer knows must still exist on devices: Alice's lost 20 €
+    // and whatever Mallory's phone holds.
+    let on_devices = 20_00 + mallory.balance();
+    let float_cents = issuer.offline_float();
+    println!(
+        "   after the payees defund, the issuer's float is {} — positive, so",
+        float(&issuer)
+    );
+    println!("   from the issuer's side nothing looks wrong");
+    println!(
+        "   but devices still hold {} (Alice's lost phone + Mallory's)",
+        euros(on_devices)
     );
     println!(
-        "   online balance:          {} cents",
-        issuer.balance_of(&alice_id).unwrap()
+        "   {} was created out of nothing, and nothing on record says which",
+        euros((on_devices as i128 - float_cents) as u64)
     );
+    println!("   device minted it: payments were never reported to anyone.");
 }
 
-fn report(settlement: Settlement, who: &str) {
-    match settlement {
-        Settlement::Credited { amount_cents } => {
-            println!("   {who}: credited {amount_cents} cents, payer stays anonymous")
-        }
-        Settlement::DuplicateDeposit => println!("   {who}: duplicate deposit, ignored"),
-        Settlement::Rejected(error) => println!("   {who}: rejected — {error}"),
-        Settlement::DoubleSpend(report) => {
-            println!("   {who}: DOUBLE SPEND on serial {}", hex(&report.serial));
-            match &report.culprit {
-                Ok(identity) => println!(
-                    "          identity recovered: {identity}\n          known account: {}",
-                    report.account_known
-                ),
-                Err(error) => println!("          slopes were not a valid identity — {error}"),
-            }
-        }
-    }
+fn new_mallory(issuer: &mut Issuer) -> Wallet<StdRng> {
+    let account = AccountId([0xdd; 16]);
+    issuer.open_account(account, 10_00);
+    let mut rng = StdRng::seed_from_u64(666);
+    enrol(
+        issuer,
+        account,
+        HOLDING_LIMIT,
+        KEY_BITS,
+        StdRng::seed_from_u64(4),
+        &mut rng,
+    )
+    .expect("enrolment")
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+fn account(issuer: &Issuer, account: AccountId) -> u64 {
+    issuer.balance_of(&account).expect("known account")
+}
+
+fn float(issuer: &Issuer) -> String {
+    let cents = issuer.offline_float();
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.unsigned_abs();
+    format!("{sign}{}.{:02} €", cents / 100, cents % 100)
+}
+
+fn euros(cents: u64) -> String {
+    format!("{}.{:02} €", cents / 100, cents % 100)
 }

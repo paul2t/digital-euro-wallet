@@ -1,266 +1,177 @@
-//! The Eurosystem-side backend: funds tokens under cut-and-choose, settles
-//! deposits, and runs the double-spend solver.
+//! The online side: the Eurosystem certifying devices, and intermediaries
+//! holding accounts and moving value on and off devices. The model folds both
+//! roles into one `Issuer`.
+//!
+//! The issuer never sees an offline payment. What it does see is every euro
+//! entering the offline circuit (funding) and every euro leaving it
+//! (defunding). The difference is the offline float: what ought to be sitting
+//! on devices. A cracked element can create value offline, which leaves real
+//! holdings above the float — but the issuer cannot see real holdings. It only
+//! notices once more has been defunded than was ever funded and the float
+//! goes negative, which may be never. Even then nothing on record says which
+//! device minted the money.
 
-use crate::blind_sig::{IssuerKeypair, IssuerPublicKey};
+use crate::certificate::DeviceCertificate;
 use crate::error::{Error, Result};
-use crate::identity::WalletId;
-use crate::token::{recover_identity, Receipt, Serial, SpendProof};
-use crate::wallet::{CutChallenge, Opening, WithdrawalRequest};
-use num_bigint::BigUint;
+use crate::id::{AccountId, DeviceId};
+use crate::message::{Defunding, Funding, FundingRequest};
+use crate::signature::{Keypair, PublicKey};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
-struct Account {
-    balance_cents: u64,
-    suspended: bool,
-}
-
-#[derive(Clone, Debug)]
-struct LedgerEntry {
-    proof: SpendProof,
-    merchant_id: [u8; 8],
-    amount_cents: u64,
-}
-
-/// What the backend concluded about one deposited receipt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Settlement {
-    /// First sighting of this serial: merchant credited.
-    Credited { amount_cents: u64 },
-    /// Same serial, same challenge, same answer — the merchant deposited twice.
-    /// Paid once, no fraud, no identity revealed.
-    DuplicateDeposit,
-    /// Same serial, two different challenges: the token was spent twice and the
-    /// payer's identity falls out of the algebra.
-    DoubleSpend(Box<FraudReport>),
-    /// The receipt did not verify at all.
-    Rejected(Error),
-}
-
-/// Evidence assembled from two conflicting spends of one token.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FraudReport {
-    pub serial: Serial,
-    pub amount_cents: u64,
-    pub first_merchant: [u8; 8],
-    pub second_merchant: [u8; 8],
-    /// `Ok` with the recovered identity, or `Err` if the slopes were not a
-    /// well-formed identity (a tampered wallet answering with noise).
-    pub culprit: Result<WalletId>,
-    /// Whether the recovered identity matches a registered account.
-    pub account_known: bool,
+struct DeviceRecord {
+    account: AccountId,
+    public_key: PublicKey,
+    last_defunding_counter: u64,
 }
 
 pub struct Issuer {
-    keypair: IssuerKeypair,
-    accounts: HashMap<WalletId, Account>,
-    ledger: HashMap<Serial, LedgerEntry>,
-    outstanding_cents: u64,
+    keypair: Keypair,
+    accounts: HashMap<AccountId, u64>,
+    devices: HashMap<DeviceId, DeviceRecord>,
+    funding_nonces: HashSet<(DeviceId, [u8; 16])>,
+    /// Funded minus defunded. Signed, because counterfeiting can drive it
+    /// below zero.
+    offline_float: i128,
 }
 
 impl Issuer {
-    pub fn new(keypair: IssuerKeypair) -> Self {
+    pub fn new(keypair: Keypair) -> Self {
         Issuer {
             keypair,
             accounts: HashMap::new(),
-            ledger: HashMap::new(),
-            outstanding_cents: 0,
+            devices: HashMap::new(),
+            funding_nonces: HashSet::new(),
+            offline_float: 0,
         }
     }
 
-    pub fn public_key(&self) -> IssuerPublicKey {
+    pub fn public_key(&self) -> PublicKey {
         self.keypair.public.clone()
     }
 
-    pub fn open_account(&mut self, identity: WalletId, balance_cents: u64) {
-        self.accounts.insert(
-            identity,
-            Account {
-                balance_cents,
-                suspended: false,
+    pub fn open_account(&mut self, account: AccountId, balance_cents: u64) {
+        self.accounts.insert(account, balance_cents);
+    }
+
+    pub fn balance_of(&self, account: &AccountId) -> Option<u64> {
+        self.accounts.get(account).copied()
+    }
+
+    /// The account a device was certified for. Only the issuer knows this.
+    pub fn account_of(&self, device: &DeviceId) -> Option<AccountId> {
+        self.devices.get(device).map(|record| record.account)
+    }
+
+    /// Value that ought to be on devices: everything funded, less everything
+    /// defunded. Counterfeiting pushes real holdings above this figure
+    /// invisibly; only a negative float proves it happened.
+    pub fn offline_float(&self) -> i128 {
+        self.offline_float
+    }
+
+    /// Certifies a device key for an account and assigns the device an id.
+    pub fn certify_device<R: Rng + ?Sized>(
+        &mut self,
+        account: AccountId,
+        public_key: &PublicKey,
+        holding_limit_cents: u64,
+        rng: &mut R,
+    ) -> Result<DeviceCertificate> {
+        if !self.accounts.contains_key(&account) {
+            return Err(Error::UnknownAccount(account));
+        }
+        let device = DeviceId(rng.gen());
+        let mut certificate = DeviceCertificate {
+            device,
+            public_key: public_key.clone(),
+            holding_limit_cents,
+            signature: Default::default(),
+        };
+        certificate.signature = self.keypair.sign(&certificate.digest());
+        self.devices.insert(
+            device,
+            DeviceRecord {
+                account,
+                public_key: public_key.clone(),
+                last_defunding_counter: 0,
             },
         );
+        Ok(certificate)
     }
 
-    pub fn balance_of(&self, identity: &WalletId) -> Option<u64> {
-        self.accounts.get(identity).map(|a| a.balance_cents)
+    fn device(&self, device: &DeviceId) -> Result<&DeviceRecord> {
+        self.devices
+            .get(device)
+            .ok_or(Error::UnknownDevice(*device))
     }
 
-    pub fn is_suspended(&self, identity: &WalletId) -> bool {
-        self.accounts
-            .get(identity)
-            .map(|a| a.suspended)
-            .unwrap_or(false)
-    }
-
-    /// Face value of issued tokens not yet redeemed.
-    pub fn outstanding_cents(&self) -> u64 {
-        self.outstanding_cents
-    }
-
-    /// Picks which candidate survives the cut. Every other candidate must be
-    /// opened, so a wallet that embedded a forged identity in `k` of `n`
-    /// candidates escapes with probability `1/n` at best.
-    pub fn cut<R: Rng + ?Sized>(
-        &self,
-        request: &WithdrawalRequest,
-        rng: &mut R,
-    ) -> Result<CutChallenge> {
-        let account = self
-            .accounts
-            .get(&request.account)
-            .ok_or(Error::UnknownAccount(request.account))?;
-        if account.suspended {
-            return Err(Error::UnknownAccount(request.account));
-        }
-        if request.candidates.len() < 2 {
-            return Err(Error::BadParameters(
-                "cut-and-choose needs at least 2 candidates",
-            ));
-        }
-        if account.balance_cents < request.amount_cents {
-            return Err(Error::InsufficientFunds {
-                requested: request.amount_cents,
-                available: account.balance_cents,
-            });
-        }
-        Ok(CutChallenge {
-            keep: rng.gen_range(0..request.candidates.len()),
-        })
-    }
-
-    /// Verifies every opened candidate, debits the online account, and blindly
-    /// signs the surviving candidate.
-    pub fn issue(
-        &mut self,
-        request: &WithdrawalRequest,
-        cut: &CutChallenge,
-        opening: &Opening,
-    ) -> Result<BigUint> {
-        let total = request.candidates.len();
-        if cut.keep >= total || opening.openings.len() + 1 != total {
-            return Err(Error::BadOpening);
-        }
-
-        let mut seen = vec![false; total];
-        for (index, revealed) in opening.openings.iter() {
-            let index = *index;
-            if index >= total || index == cut.keep || seen[index] {
-                return Err(Error::BadOpening);
-            }
-            seen[index] = true;
-
-            // The commitment must bind the revealed lines and the payload.
-            if revealed.lines.commitment() != revealed.payload.commitment
-                || revealed.payload.commitment != request.candidates[index].commitment
-            {
-                return Err(Error::CommitmentMismatch { index });
-            }
-            // The payload must be worth what was asked for.
-            if revealed.payload.amount_cents != request.amount_cents
-                || revealed.payload.expiry_epoch != request.expiry_epoch
-            {
-                return Err(Error::CommitmentMismatch { index });
-            }
-            // The slopes must carry the account holder's true identity.
-            match revealed.lines.embedded_identity() {
-                Ok(identity) if identity == request.account => {}
-                _ => return Err(Error::IdentityNotEmbedded { index }),
-            }
-            // And the blinded message must really be that payload.
-            let expected = self
-                .keypair
-                .public
-                .blind(&revealed.payload.digest(), &revealed.blinding_factor);
-            if expected != request.candidates[index].blinded_message {
-                return Err(Error::BlindingMismatch { index });
-            }
-        }
-
-        let account = self
-            .accounts
-            .get_mut(&request.account)
-            .ok_or(Error::UnknownAccount(request.account))?;
-        if account.balance_cents < request.amount_cents {
-            return Err(Error::InsufficientFunds {
-                requested: request.amount_cents,
-                available: account.balance_cents,
-            });
-        }
-        account.balance_cents -= request.amount_cents;
-        self.outstanding_cents += request.amount_cents;
-
-        // The issuer signs a value it cannot read: it knows the token is
-        // well-formed, not which token it is.
-        Ok(self
-            .keypair
-            .sign_blinded(&request.candidates[cut.keep].blinded_message))
-    }
-
-    /// Settles one deposited receipt.
-    pub fn redeem(&mut self, receipt: &Receipt) -> Settlement {
-        if !self
-            .keypair
-            .public
-            .verify(&receipt.token.payload.digest(), &receipt.token.signature)
+    /// Debits the device's account and signs the funding for the element.
+    pub fn fund(&mut self, request: &FundingRequest) -> Result<Funding> {
+        let record = self.device(&request.device)?;
+        if !record
+            .public_key
+            .verify(&request.digest(), &request.signature)
         {
-            return Settlement::Rejected(Error::InvalidTokenSignature);
+            return Err(Error::InvalidSignature);
         }
-        if receipt.proof.challenge.is_zero() {
-            return Settlement::Rejected(Error::DegenerateChallenge);
+        if request.amount_cents == 0 {
+            return Err(Error::ZeroAmount);
         }
+        if self
+            .funding_nonces
+            .contains(&(request.device, request.nonce))
+        {
+            return Err(Error::Replay);
+        }
+        let account = record.account;
+        let balance = self
+            .accounts
+            .get_mut(&account)
+            .ok_or(Error::UnknownAccount(account))?;
+        if *balance < request.amount_cents {
+            return Err(Error::InsufficientFunds {
+                requested: request.amount_cents,
+                available: *balance,
+            });
+        }
+        *balance -= request.amount_cents;
+        self.offline_float += request.amount_cents as i128;
+        self.funding_nonces.insert((request.device, request.nonce));
 
-        let serial = receipt.token.payload.serial;
-        let amount_cents = receipt.token.payload.amount_cents;
-
-        let previous = match self.ledger.get(&serial) {
-            None => {
-                self.ledger.insert(
-                    serial,
-                    LedgerEntry {
-                        proof: receipt.proof.clone(),
-                        merchant_id: receipt.merchant_id,
-                        amount_cents,
-                    },
-                );
-                self.outstanding_cents = self.outstanding_cents.saturating_sub(amount_cents);
-                return Settlement::Credited { amount_cents };
-            }
-            Some(entry) => entry.clone(),
+        let mut funding = Funding {
+            device: request.device,
+            amount_cents: request.amount_cents,
+            nonce: request.nonce,
+            signature: Default::default(),
         };
+        funding.signature = self.keypair.sign(&funding.digest());
+        Ok(funding)
+    }
 
-        if previous.proof.challenge == receipt.proof.challenge {
-            return if previous.proof.response == receipt.proof.response {
-                Settlement::DuplicateDeposit
-            } else {
-                // Same abscissa, different ordinate: the two points are not on
-                // any single line, so this is a forged response rather than a
-                // double-spend. No identity can be extracted.
-                Settlement::Rejected(Error::ChallengeMismatch)
-            };
+    /// Credits the device's account with value the element has debited.
+    pub fn defund(&mut self, defunding: &Defunding) -> Result<u64> {
+        let record = self.device(&defunding.device)?;
+        if !record
+            .public_key
+            .verify(&defunding.digest(), &defunding.signature)
+        {
+            return Err(Error::InvalidSignature);
         }
-
-        // Two points, two different abscissae — solve for the slope.
-        let culprit = recover_identity(&previous.proof, &receipt.proof)
-            .expect("challenges differ, so the inverse exists");
-        let account_known =
-            matches!(&culprit, Ok(identity) if self.accounts.contains_key(identity));
-        if let Ok(identity) = &culprit {
-            if let Some(account) = self.accounts.get_mut(identity) {
-                account.suspended = true;
-                // Claw back the duplicated value from the online balance.
-                account.balance_cents = account.balance_cents.saturating_sub(amount_cents);
-            }
+        if defunding.counter <= record.last_defunding_counter {
+            return Err(Error::Replay);
         }
-
-        Settlement::DoubleSpend(Box::new(FraudReport {
-            serial,
-            amount_cents: previous.amount_cents,
-            first_merchant: previous.merchant_id,
-            second_merchant: receipt.merchant_id,
-            culprit,
-            account_known,
-        }))
+        let account = record.account;
+        let balance = self
+            .accounts
+            .get_mut(&account)
+            .ok_or(Error::UnknownAccount(account))?;
+        *balance += defunding.amount_cents;
+        self.offline_float -= defunding.amount_cents as i128;
+        if let Some(record) = self.devices.get_mut(&defunding.device) {
+            record.last_defunding_counter = defunding.counter;
+        }
+        Ok(defunding.amount_cents)
     }
 }

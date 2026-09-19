@@ -1,7 +1,8 @@
 //! Domain-separated hashing helpers.
 //!
-//! Every hash in the protocol goes through [`tagged`] so that a commitment can
-//! never be replayed as a challenge, a token message, or a mask.
+//! Every hash in the protocol goes through [`tagged`] so that a signed message
+//! of one kind — a transfer, say — can never be passed off as another, such as
+//! a defunding order or a device certificate.
 
 use sha2::{Digest, Sha256};
 
